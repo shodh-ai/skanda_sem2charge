@@ -1,0 +1,8 @@
+data/
+experiments/
+
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+*.pyc
+.DS_Store

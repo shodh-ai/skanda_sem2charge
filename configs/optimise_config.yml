@@ -1,0 +1,50 @@
+# Dataset split configuration
+data:
+  total_samples: 100
+  params_per_sample: 60
+
+  # Split ratios
+  splits:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+
+  # Optimization settings
+  chunk_size: 64
+  num_workers: 4
+
+  # Image preprocessing
+  image:
+    pore_value: 0
+    solid_value: 255
+    binary_pore: 0.0
+    binary_solid: 1.0
+
+  # Input features (battery design parameters)
+  input_features:
+    - "input_SEI kinetic rate constant [m.s-1]"
+    - "input_Electrolyte diffusivity [m2.s-1]"
+    - "input_Initial concentration in electrolyte [mol.m-3]"
+    - "input_Separator porosity"
+    - "input_Separator Bruggeman coefficient (electrolyte)"
+    - "input_Separator Bruggeman coefficient"
+    - "input_Positive particle radius [m]"
+    - "input_Negative particle radius [m]"
+    - "input_Positive electrode thickness [m]"
+    - "input_Negative electrode thickness [m]"
+
+  # Output features
+  output_features:
+    microstructure:
+      - "D_eff"
+      - "porosity_measured"
+      - "tau_factor"
+      - "bruggeman_derived"
+    performance:
+      - "nominal_capacity_Ah"
+      - "eol_cycle_measured"
+      - "initial_capacity_Ah"
+      - "final_capacity_Ah"
+      - "capacity_retention_percent"
+      - "total_cycles"
+      - "final_RUL"

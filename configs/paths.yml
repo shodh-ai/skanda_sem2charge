@@ -1,0 +1,21 @@
+# Data paths
+data:
+  base_dir: "./data/raw"
+
+  # Input data
+  input:
+    images_dir: "output_parameter_sweep"
+    image_pattern: "sample_{:04d}.tif"
+    final_results_csv: "output_parameter_sweep/final_results.csv"
+    tau_results_csv: "output_parameter_sweep/taufactor_results.csv"
+    parquet_dir: "final_pybamm_output"
+    parquet_pattern: "results_rank_{}.parquet"
+
+  # Output data
+  output:
+    intermediate_dir: "./data/intermediate"
+    optimized_dir: "./data/optimized"
+    train_dir: "train"
+    val_dir: "val"
+    test_dir: "test"
+    stats_file: "normalization_stats.json"
