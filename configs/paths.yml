@@ -14,6 +14,7 @@ data:
   # Output data
   output:
     intermediate_dir: "./data/intermediate"
+    pruned_dir: "./data/pruned"
     optimized_dir: "./data/optimized"
     train_dir: "train"
     val_dir: "val"
