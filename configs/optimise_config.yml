@@ -5,9 +5,9 @@ data:
 
   # Split ratios
   splits:
-    train: 0.8
-    val: 0.1
-    test: 0.1
+    train: 0.7
+    val: 0.15
+    test: 0.15
 
   # Optimization settings
   chunk_size: 64
@@ -41,10 +41,8 @@ data:
       - "tau_factor"
       - "bruggeman_derived"
     performance:
-      - "nominal_capacity_Ah"
       - "eol_cycle_measured"
       - "initial_capacity_Ah"
       - "final_capacity_Ah"
       - "capacity_retention_percent"
       - "total_cycles"
-      - "final_RUL"

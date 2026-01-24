@@ -11,3 +11,8 @@ numpy
 tqdm
 mpi4py
 PyYAML
+scikit-learn
+torch
+pytorch-lightning
+tensorboard
+tensorboardX

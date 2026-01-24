@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 MPI-enabled script to prune intermediate data by:
-1. Removing rows where tau_factor > 8
-2. Removing rows with any NaN values in input, microstructure, or performance parameters
-3. Saving to a single parquet file: data/intermediate_pruned.parquet
+1. Removing rows where tau_factor > 8 (physical constraint)
+2. Removing rows with any NaN values (data quality)
+3. Removing statistical outliers using IQR method (data cleanup)
+4. Saving to: data/intermediate_pruned.parquet
 
 Usage:
     Single process: python prune_intermediate_data.py
@@ -26,7 +27,10 @@ except ImportError:
     print("Install with: pip install mpi4py")
 
 
-# Feature definitions
+# ============================================================================
+# FEATURE DEFINITIONS
+# ============================================================================
+
 INPUT_FEATURES = [
     "SEI_kinetic_rate",
     "Electrolyte_diffusivity",
@@ -48,17 +52,53 @@ MICROSTRUCTURE_FEATURES = [
 ]
 
 PERFORMANCE_FEATURES = [
-    "nominal_capacity_Ah",
     "eol_cycle_measured",
     "initial_capacity_Ah",
     "final_capacity_Ah",
     "capacity_retention_percent",
     "total_cycles",
-    "final_RUL",
 ]
 
-# Pruning thresholds
+# ============================================================================
+# PRUNING CONFIGURATION
+# ============================================================================
+
+# Physical constraint threshold
 TAU_FACTOR_MAX = 8.0
+
+# Outlier removal configuration (IQR method)
+OUTLIER_CONFIG = {
+    "enabled": True,
+    "method": "IQR",  # IQR method (Q1 - 1.5*IQR, Q3 + 1.5*IQR)
+    "iqr_multiplier": 1.5,  # Standard IQR multiplier (1.5 for outliers, 3.0 for extreme outliers)
+    # Features to check for outliers (exclude constant features)
+    "features_to_check": [
+        # Input features (exclude Initial_conc_electrolyte - it's constant)
+        "SEI_kinetic_rate",
+        "Electrolyte_diffusivity",
+        "Separator_porosity",
+        "Separator_Bruggeman_electrolyte",
+        "Separator_Bruggeman",
+        "Positive_particle_radius",
+        "Negative_particle_radius",
+        "Positive_electrode_thickness",
+        "Negative_electrode_thickness",
+        # Microstructure features (all)
+        "D_eff",
+        "porosity_measured",
+        "tau_factor",
+        "bruggeman_derived",
+        # Performance features (key ones)
+        "initial_capacity_Ah",
+        "final_capacity_Ah",
+        "capacity_retention_percent",
+    ],
+}
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 
 def load_config():
@@ -86,8 +126,13 @@ def get_mpi_info():
     return comm, rank, size
 
 
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
+
 def load_intermediate_data_parallel(intermediate_dir, rank, size):
-    """Load intermediate parquet files in parallel (each rank loads subset)"""
+    """Load intermediate parquet files in parallel"""
     intermediate_path = Path(intermediate_dir)
     parquet_files = sorted(intermediate_path.glob("data_rank*.parquet"))
 
@@ -107,7 +152,7 @@ def load_intermediate_data_parallel(intermediate_dir, rank, size):
     for pf in my_files:
         df = pd.read_parquet(pf)
         dfs.append(df)
-        if rank == 0 or len(my_files) <= 3:  # Print details for rank 0 or if few files
+        if rank == 0 or len(my_files) <= 3:
             print(f"  Rank {rank}: {pf.name} - {len(df)} rows")
 
     if dfs:
@@ -115,7 +160,7 @@ def load_intermediate_data_parallel(intermediate_dir, rank, size):
         if rank == 0:
             print(f"\nRank {rank} loaded {len(df_local)} rows")
     else:
-        df_local = pd.DataFrame()  # Empty dataframe if no files assigned
+        df_local = pd.DataFrame()
 
     return df_local
 
@@ -126,7 +171,6 @@ def expand_dataframe(df_local, rank):
         print("\nExpanding nested data structures...")
 
     if len(df_local) == 0:
-        # Return empty expanded dataframe with correct columns
         all_cols = (
             ["sample_id", "param_id"]
             + INPUT_FEATURES
@@ -135,19 +179,17 @@ def expand_dataframe(df_local, rank):
         )
         return pd.DataFrame(columns=all_cols)
 
-    # Extract input parameters
+    # Extract arrays
     input_arrays = np.array(df_local["input_params"].tolist())
     df_inputs = pd.DataFrame(input_arrays, columns=INPUT_FEATURES)
 
-    # Extract microstructure outputs
     micro_arrays = np.array(df_local["microstructure_outputs"].tolist())
     df_micro = pd.DataFrame(micro_arrays, columns=MICROSTRUCTURE_FEATURES)
 
-    # Extract performance outputs
     perf_arrays = np.array(df_local["performance_outputs"].tolist())
     df_perf = pd.DataFrame(perf_arrays, columns=PERFORMANCE_FEATURES)
 
-    # Combine everything
+    # Combine
     df_expanded = pd.concat(
         [
             df_local[["sample_id", "param_id"]].reset_index(drop=True),
@@ -164,68 +206,316 @@ def expand_dataframe(df_local, rank):
     return df_expanded
 
 
-def prune_data_local(df_expanded, rank, tau_max=TAU_FACTOR_MAX):
-    """Prune data locally on each rank"""
-    initial_samples = len(df_expanded)
-
-    if len(df_expanded) == 0:
-        return df_expanded, {"initial": 0, "after_tau": 0, "final": 0}
-
-    # Step 1: Remove rows where tau_factor > tau_max
-    df_pruned = df_expanded[df_expanded["tau_factor"] <= tau_max].copy()
-    after_tau = len(df_pruned)
-
-    # Step 2: Remove rows with any NaN values
-    all_param_cols = INPUT_FEATURES + MICROSTRUCTURE_FEATURES + PERFORMANCE_FEATURES
-    df_pruned = df_pruned.dropna(subset=all_param_cols)
-    final_samples = len(df_pruned)
-
-    stats = {"initial": initial_samples, "after_tau": after_tau, "final": final_samples}
-
-    if rank == 0 or initial_samples > 0:
-        print(
-            f"Rank {rank}: {initial_samples} -> {after_tau} -> {final_samples} samples"
-        )
-
-    return df_pruned, stats
+# ============================================================================
+# PRUNING STEP 1: TAU FACTOR FILTERING
+# ============================================================================
 
 
-def gather_and_print_stats(stats, comm, rank, size, tau_max):
-    """Gather statistics from all ranks and print summary"""
-    if comm is not None:
-        # Gather stats from all ranks
-        all_stats = comm.gather(stats, root=0)
-    else:
-        all_stats = [stats]
+def filter_tau_factor(df_expanded, rank, tau_max=TAU_FACTOR_MAX):
+    """
+    Step 1: Remove rows where tau_factor > tau_max (physical constraint)
+
+    Args:
+        df_expanded: Expanded DataFrame
+        rank: MPI rank
+        tau_max: Maximum allowed tau_factor value
+
+    Returns:
+        Filtered DataFrame and statistics
+    """
+    initial_count = len(df_expanded)
+
+    if initial_count == 0:
+        return df_expanded, {"initial": 0, "final": 0, "removed": 0}
+
+    # Filter by tau_factor
+    df_filtered = df_expanded[df_expanded["tau_factor"] <= tau_max].copy()
+    final_count = len(df_filtered)
+    removed_count = initial_count - final_count
+
+    stats = {"initial": initial_count, "final": final_count, "removed": removed_count}
 
     if rank == 0:
-        # Aggregate statistics
-        total_initial = sum(s["initial"] for s in all_stats)
-        total_after_tau = sum(s["after_tau"] for s in all_stats)
-        total_final = sum(s["final"] for s in all_stats)
+        print(f"\nRank {rank} - Tau Factor Filtering:")
+        print(f"  Initial samples:     {initial_count:,}")
+        print(f"  After filtering:     {final_count:,}")
+        print(
+            f"  Removed:             {removed_count:,} ({removed_count/initial_count*100:.2f}%)"
+        )
 
-        print("\n" + "=" * 60)
-        print("PRUNING SUMMARY (AGGREGATED FROM ALL RANKS)")
-        print("=" * 60)
-        print(f"Conditions:")
-        print(f"  - tau_factor <= {tau_max}")
-        print(f"  - No NaN values in any parameter")
-        print("=" * 60)
-        print(f"\nInitial samples:     {total_initial:,}")
-        print(f"\nAfter tau clipping:  {total_after_tau:,}")
-        print(f"  Removed:           {total_initial - total_after_tau:,}")
-        print(f"  Retention:         {total_after_tau/total_initial*100:.2f}%")
-        print(f"\nAfter NaN removal:   {total_final:,}")
-        print(f"  Removed:           {total_after_tau - total_final:,}")
-        print(f"  Retention:         {total_final/total_after_tau*100:.2f}%")
-        print(f"\n{'='*60}")
-        print(f"FINAL SUMMARY")
-        print(f"{'='*60}")
-        print(f"Initial samples:     {total_initial:,}")
-        print(f"Final samples:       {total_final:,}")
-        print(f"Total removed:       {total_initial - total_final:,}")
-        print(f"Overall retention:   {total_final/total_initial*100:.2f}%")
-        print("=" * 60)
+    return df_filtered, stats
+
+
+# ============================================================================
+# PRUNING STEP 2: NaN REMOVAL
+# ============================================================================
+
+
+def remove_nans(df, rank):
+    """
+    Step 2: Remove rows with any NaN values (data quality)
+
+    Args:
+        df: DataFrame to clean
+        rank: MPI rank
+
+    Returns:
+        Cleaned DataFrame and statistics
+    """
+    initial_count = len(df)
+
+    if initial_count == 0:
+        return df, {"initial": 0, "final": 0, "removed": 0}
+
+    # Check for NaNs in all parameter columns
+    all_param_cols = INPUT_FEATURES + MICROSTRUCTURE_FEATURES + PERFORMANCE_FEATURES
+    df_clean = df.dropna(subset=all_param_cols)
+    final_count = len(df_clean)
+    removed_count = initial_count - final_count
+
+    stats = {"initial": initial_count, "final": final_count, "removed": removed_count}
+
+    if rank == 0:
+        print(f"\nRank {rank} - NaN Removal:")
+        print(f"  Initial samples:     {initial_count:,}")
+        print(f"  After NaN removal:   {final_count:,}")
+        print(
+            f"  Removed:             {removed_count:,} ({removed_count/initial_count*100:.2f}%)"
+        )
+
+    return df_clean, stats
+
+
+# ============================================================================
+# PRUNING STEP 3: OUTLIER REMOVAL
+# ============================================================================
+
+
+def detect_outliers_iqr(df, features, multiplier=1.5):
+    """
+    Detect outliers using IQR method
+
+    Args:
+        df: DataFrame with expanded features
+        features: List of feature names to check
+        multiplier: IQR multiplier (1.5 for standard outliers, 3.0 for extreme)
+
+    Returns:
+        Boolean mask where True indicates outlier, and outlier counts per feature
+    """
+    outlier_mask = pd.Series(False, index=df.index)
+    outlier_counts = {}
+    outlier_bounds = {}
+
+    for feat in features:
+        if feat not in df.columns:
+            continue
+
+        data = df[feat].dropna()
+
+        if len(data) == 0:
+            continue
+
+        # Calculate IQR
+        Q1 = data.quantile(0.25)
+        Q3 = data.quantile(0.75)
+        IQR = Q3 - Q1
+
+        # Define outlier bounds
+        lower_bound = Q1 - multiplier * IQR
+        upper_bound = Q3 + multiplier * IQR
+
+        # Store bounds for reporting
+        outlier_bounds[feat] = {
+            "lower": lower_bound,
+            "upper": upper_bound,
+            "Q1": Q1,
+            "Q3": Q3,
+            "IQR": IQR,
+        }
+
+        # Mark outliers
+        feat_outliers = (df[feat] < lower_bound) | (df[feat] > upper_bound)
+        outlier_counts[feat] = feat_outliers.sum()
+
+        # Update overall mask (OR operation - any feature is outlier)
+        outlier_mask = outlier_mask | feat_outliers
+
+    return outlier_mask, outlier_counts, outlier_bounds
+
+
+def remove_outliers(df, rank, config=OUTLIER_CONFIG):
+    """
+    Step 3: Remove statistical outliers (data cleanup)
+
+    Args:
+        df: DataFrame to clean
+        rank: MPI rank
+        config: Outlier removal configuration
+
+    Returns:
+        Cleaned DataFrame and detailed statistics
+    """
+    if not config["enabled"] or len(df) == 0:
+        return df, {}
+
+    initial_count = len(df)
+
+    # Detect outliers using IQR method
+    outlier_mask, outlier_counts, outlier_bounds = detect_outliers_iqr(
+        df, config["features_to_check"], config["iqr_multiplier"]
+    )
+
+    # Remove outliers
+    df_clean = df[~outlier_mask].copy()
+    final_count = len(df_clean)
+    removed_count = initial_count - final_count
+
+    stats = {
+        "initial": initial_count,
+        "final": final_count,
+        "removed": removed_count,
+        "outlier_counts": outlier_counts,
+        "outlier_bounds": outlier_bounds,
+    }
+
+    if rank == 0:
+        print(f"\nRank {rank} - Outlier Removal:")
+        print(f"  Initial samples:     {initial_count:,}")
+        print(f"  After outlier removal: {final_count:,}")
+        print(
+            f"  Removed:             {removed_count:,} ({removed_count/initial_count*100:.2f}%)"
+        )
+
+        # Show top features with outliers
+        if outlier_counts:
+            sorted_outliers = sorted(
+                outlier_counts.items(), key=lambda x: x[1], reverse=True
+            )
+            print(f"\n  Top 10 features with outliers:")
+            for feat, count in sorted_outliers[:10]:
+                if count > 0:
+                    pct = count / initial_count * 100
+                    bounds = outlier_bounds[feat]
+                    print(
+                        f"    {feat:40s}: {count:6,} ({pct:5.2f}%) | Bounds: [{bounds['lower']:.6e}, {bounds['upper']:.6e}]"
+                    )
+
+    return df_clean, stats
+
+
+# ============================================================================
+# STATISTICS AND REPORTING
+# ============================================================================
+
+
+def gather_and_print_stats(
+    tau_stats, nan_stats, outlier_stats, comm, rank, size, tau_max
+):
+    """Gather statistics from all ranks and print comprehensive summary"""
+    if comm is not None:
+        all_tau_stats = comm.gather(tau_stats, root=0)
+        all_nan_stats = comm.gather(nan_stats, root=0)
+        all_outlier_stats = comm.gather(outlier_stats, root=0)
+    else:
+        all_tau_stats = [tau_stats]
+        all_nan_stats = [nan_stats]
+        all_outlier_stats = [outlier_stats]
+
+    if rank == 0:
+        print("\n" + "=" * 80)
+        print("COMPREHENSIVE PRUNING SUMMARY (ALL RANKS AGGREGATED)")
+        print("=" * 80)
+
+        # Calculate totals for each step
+
+        # Step 1: Tau Factor Filtering
+        tau_initial = sum(s.get("initial", 0) for s in all_tau_stats)
+        tau_final = sum(s.get("final", 0) for s in all_tau_stats)
+        tau_removed = sum(s.get("removed", 0) for s in all_tau_stats)
+
+        print(f"\nSTEP 1: TAU FACTOR FILTERING (Physical Constraint)")
+        print(f"{'─'*80}")
+        print(f"  Constraint: tau_factor <= {tau_max}")
+        print(f"  Initial samples:        {tau_initial:,}")
+        print(f"  Samples passing filter: {tau_final:,}")
+        print(f"  Samples removed:        {tau_removed:,}")
+        print(f"  Retention rate:         {tau_final/tau_initial*100:.2f}%")
+
+        # Step 2: NaN Removal
+        nan_initial = sum(s.get("initial", 0) for s in all_nan_stats)
+        nan_final = sum(s.get("final", 0) for s in all_nan_stats)
+        nan_removed = sum(s.get("removed", 0) for s in all_nan_stats)
+
+        print(f"\nSTEP 2: NaN REMOVAL (Data Quality)")
+        print(f"{'─'*80}")
+        print(f"  Initial samples:        {nan_initial:,}")
+        print(f"  Samples without NaNs:   {nan_final:,}")
+        print(f"  Samples removed:        {nan_removed:,}")
+        print(f"  Retention rate:         {nan_final/nan_initial*100:.2f}%")
+
+        # Step 3: Outlier Removal
+        if OUTLIER_CONFIG["enabled"] and all_outlier_stats[0]:
+            outlier_initial = sum(s.get("initial", 0) for s in all_outlier_stats)
+            outlier_final = sum(s.get("final", 0) for s in all_outlier_stats)
+            outlier_removed = sum(s.get("removed", 0) for s in all_outlier_stats)
+
+            print(f"\nSTEP 3: OUTLIER REMOVAL (Statistical Cleanup)")
+            print(f"{'─'*80}")
+            print(f"  Method: IQR with multiplier {OUTLIER_CONFIG['iqr_multiplier']}")
+            print(f"  Initial samples:        {outlier_initial:,}")
+            print(f"  Samples without outliers: {outlier_final:,}")
+            print(f"  Samples removed:        {outlier_removed:,}")
+            print(f"  Retention rate:         {outlier_final/outlier_initial*100:.2f}%")
+
+            # Aggregate outlier counts across all ranks
+            total_outlier_counts = {}
+            for stats in all_outlier_stats:
+                if "outlier_counts" in stats:
+                    for feat, count in stats["outlier_counts"].items():
+                        total_outlier_counts[feat] = (
+                            total_outlier_counts.get(feat, 0) + count
+                        )
+
+            if total_outlier_counts:
+                sorted_outliers = sorted(
+                    total_outlier_counts.items(), key=lambda x: x[1], reverse=True
+                )
+                print(f"\n  Top features contributing to outliers:")
+                for feat, count in sorted_outliers[:10]:
+                    if count > 0:
+                        pct = count / outlier_initial * 100
+                        print(f"    {feat:40s}: {count:6,} ({pct:5.2f}%)")
+
+            final_total = outlier_final
+        else:
+            final_total = nan_final
+
+        # Overall Summary
+        print(f"\n{'='*80}")
+        print(f"OVERALL SUMMARY")
+        print(f"{'='*80}")
+        print(f"  Initial samples:        {tau_initial:,}")
+        print(f"  Final clean samples:    {final_total:,}")
+        print(f"  Total samples removed:  {tau_initial - final_total:,}")
+        print(f"  Overall retention:      {final_total/tau_initial*100:.2f}%")
+        print(f"\n  Breakdown of removed samples:")
+        print(
+            f"    Tau factor > {tau_max}:    {tau_removed:,} ({tau_removed/tau_initial*100:.2f}%)"
+        )
+        print(
+            f"    NaN values:           {nan_removed:,} ({nan_removed/tau_initial*100:.2f}%)"
+        )
+        if OUTLIER_CONFIG["enabled"] and all_outlier_stats[0]:
+            print(
+                f"    Statistical outliers: {outlier_removed:,} ({outlier_removed/tau_initial*100:.2f}%)"
+            )
+        print("=" * 80)
+
+
+# ============================================================================
+# DATA GATHERING AND SAVING
+# ============================================================================
 
 
 def gather_pruned_data(df_pruned_local, df_local, comm, rank):
@@ -233,12 +523,9 @@ def gather_pruned_data(df_pruned_local, df_local, comm, rank):
     if comm is not None:
         # Get original rows that match pruned indices
         df_export_local = df_local[df_local.index.isin(df_pruned_local.index)].copy()
-
-        # Gather all dataframes to rank 0
         all_dfs = comm.gather(df_export_local, root=0)
 
         if rank == 0:
-            # Concatenate all gathered dataframes
             df_pruned_full = pd.concat(
                 [df for df in all_dfs if len(df) > 0], ignore_index=True
             )
@@ -246,7 +533,6 @@ def gather_pruned_data(df_pruned_local, df_local, comm, rank):
         else:
             return None
     else:
-        # Serial mode
         df_export_local = df_local[df_local.index.isin(df_pruned_local.index)].copy()
         return df_export_local
 
@@ -260,83 +546,132 @@ def save_pruned_data(df_pruned_full, output_file, rank):
         print("Warning: No data to save!")
         return
 
-    # Ensure output directory exists
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Reset index and save
     df_pruned_full = df_pruned_full.reset_index(drop=True)
     df_pruned_full.to_parquet(output_path, index=False)
 
-    # Get file size
     file_size_mb = output_path.stat().st_size / (1024 * 1024)
 
-    print(f"\n✓ Pruned data saved successfully!")
+    print(f"\n✅ PRUNED DATA SAVED SUCCESSFULLY!")
+    print(f"{'─'*80}")
     print(f"  File: {output_path}")
     print(f"  Rows: {len(df_pruned_full):,}")
+    print(f"  Columns: {len(df_pruned_full.columns)}")
     print(f"  Size: {file_size_mb:.2f} MB")
+    print(f"{'─'*80}")
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
 
 
 def main():
     """Main execution function"""
-    # Get MPI info
     comm, rank, size = get_mpi_info()
 
     if rank == 0:
-        print("=" * 60)
+        print("=" * 80)
         print("MPI-ENABLED DATA PRUNING SCRIPT")
-        print("=" * 60)
+        print("Sequential Flow: Tau Filter → NaN Removal → Outlier Removal")
+        print("=" * 80)
         print(f"MPI Processes: {size}")
         print(f"MPI Available: {MPI_AVAILABLE}")
+        print(f"\nPruning Configuration:")
+        print(f"  Step 1 - Tau factor max: {TAU_FACTOR_MAX}")
+        print(f"  Step 2 - NaN removal: Enabled")
+        print(f"  Step 3 - Outlier removal: {OUTLIER_CONFIG['enabled']}")
+        if OUTLIER_CONFIG["enabled"]:
+            print(f"           Method: {OUTLIER_CONFIG['method']}")
+            print(f"           IQR multiplier: {OUTLIER_CONFIG['iqr_multiplier']}")
+            print(
+                f"           Features checked: {len(OUTLIER_CONFIG['features_to_check'])}"
+            )
 
-    # Load configuration (all ranks)
+    # Load configuration
     if rank == 0:
         print("\nLoading configuration...")
 
     paths_config, opt_config = load_config()
-
-    # Get paths from config
     intermediate_dir = paths_config["data"]["output"]["intermediate_dir"]
     output_file = Path("data") / "intermediate_pruned.parquet"
 
     if rank == 0:
-        print(f"  Intermediate directory: {intermediate_dir}")
+        print(f"  Input directory: {intermediate_dir}")
         print(f"  Output file: {output_file}")
         print()
 
-    # Load data in parallel (each rank loads subset of files)
+    # Load data in parallel
     df_local = load_intermediate_data_parallel(intermediate_dir, rank, size)
 
-    # Expand nested structures (each rank processes its data)
-    df_expanded_local = expand_dataframe(df_local, rank)
+    # Expand nested structures
+    df_expanded = expand_dataframe(df_local, rank)
 
-    # Prune data locally
+    # ========================================================================
+    # PRUNING PIPELINE: Tau → NaN → Outliers
+    # ========================================================================
+
+    # STEP 1: Tau Factor Filtering (Physical Constraint)
     if rank == 0:
-        print("\nPruning data on all ranks...")
-    df_pruned_local, stats = prune_data_local(
-        df_expanded_local, rank, tau_max=TAU_FACTOR_MAX
-    )
+        print("\n" + "=" * 80)
+        print("STEP 1: TAU FACTOR FILTERING (Physical Constraint)")
+        print("=" * 80)
 
-    # Gather and print statistics
-    gather_and_print_stats(stats, comm, rank, size, TAU_FACTOR_MAX)
+    df_after_tau, tau_stats = filter_tau_factor(df_expanded, rank, TAU_FACTOR_MAX)
+
+    # STEP 2: NaN Removal (Data Quality)
+    if rank == 0:
+        print("\n" + "=" * 80)
+        print("STEP 2: NaN REMOVAL (Data Quality)")
+        print("=" * 80)
+
+    df_after_nan, nan_stats = remove_nans(df_after_tau, rank)
+
+    # STEP 3: Outlier Removal (Statistical Cleanup)
+    outlier_stats = {}
+    if OUTLIER_CONFIG["enabled"]:
+        if rank == 0:
+            print("\n" + "=" * 80)
+            print("STEP 3: OUTLIER REMOVAL (Statistical Cleanup)")
+            print("=" * 80)
+
+        df_final, outlier_stats = remove_outliers(df_after_nan, rank, OUTLIER_CONFIG)
+    else:
+        df_final = df_after_nan
+        if rank == 0:
+            print("\nStep 3: Outlier removal disabled")
+
+    # ========================================================================
+    # GATHER STATISTICS AND SAVE
+    # ========================================================================
+
+    # Gather and print comprehensive statistics
+    gather_and_print_stats(
+        tau_stats, nan_stats, outlier_stats, comm, rank, size, TAU_FACTOR_MAX
+    )
 
     # Gather pruned data to rank 0
     if rank == 0:
         print("\nGathering pruned data from all ranks...")
-    df_pruned_full = gather_pruned_data(df_pruned_local, df_local, comm, rank)
+    df_pruned_full = gather_pruned_data(df_final, df_local, comm, rank)
 
-    # Save results (only rank 0)
+    # Save results
     save_pruned_data(df_pruned_full, output_file, rank)
 
     if rank == 0:
-        print("\n" + "=" * 60)
-        print("PRUNING COMPLETE!")
-        print("=" * 60)
-        print(f"\nNext steps:")
-        print(f"  1. Use this file for creating optimized dataset:")
-        print(f"     python create_optimized_dataset.py")
-        print(f"  2. The file is ready to be loaded into memory for processing")
-        print("=" * 60)
+        print("\n" + "=" * 80)
+        print("🎉 PRUNING COMPLETE!")
+        print("=" * 80)
+        print(f"\nData Quality Pipeline Executed:")
+        print(f"  1. ✓ Physical constraint (tau_factor <= {TAU_FACTOR_MAX})")
+        print(f"  2. ✓ Data quality (NaN removal)")
+        print(f"  3. ✓ Statistical cleanup (outlier removal)")
+        print(f"\nNext Steps:")
+        print(f"  → Run: python create_optimized_dataset.py")
+        print(f"  → This will create train/val/test splits with normalization")
+        print("=" * 80)
 
 
 if __name__ == "__main__":

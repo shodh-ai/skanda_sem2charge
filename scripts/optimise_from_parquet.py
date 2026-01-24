@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Step 2: Create optimized binary chunks from intermediate parquet
-Supports multi-worker processing on both macOS and Linux
-- macOS: Works with spawn mode (slower but functional)
-- Linux: Full speed with fork mode and 256+ workers
+Step 2: Create optimized binary chunks from pruned parquet
+- Proper normalization for DNN (Min-Max or Z-score)
+- Train/Val/Test split
+- Handles negative values appropriately
+- Multi-worker processing support
+
+Usage:
+    python create_optimized_dataset.py
 """
 
 import numpy as np
@@ -15,7 +19,8 @@ import platform
 from pathlib import Path
 from typing import Dict, List, Tuple
 from litdata import optimize
-from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+
 
 # ============================================================================
 # CONFIGURATION
@@ -36,50 +41,124 @@ def load_config():
 
 
 # ============================================================================
+# DATA SPLITTING
+# ============================================================================
+
+
+def split_data(df, config):
+    """
+    Split data into train/val/test sets
+
+    Args:
+        df: DataFrame with pruned data
+        config: Configuration dict with split ratios
+
+    Returns:
+        train_df, val_df, test_df
+    """
+    # Get split ratios from config
+    train_ratio = config["data"].get("train_split", 0.7)
+    val_ratio = config["data"].get("val_split", 0.15)
+    test_ratio = config["data"].get("test_split", 0.15)
+
+    # Validate ratios
+    total = train_ratio + val_ratio + test_ratio
+    assert abs(total - 1.0) < 1e-6, f"Split ratios must sum to 1.0, got {total}"
+
+    print(f"\n📊 Splitting data:")
+    print(f"   Train: {train_ratio*100:.1f}%")
+    print(f"   Val:   {val_ratio*100:.1f}%")
+    print(f"   Test:  {test_ratio*100:.1f}%")
+
+    # Random seed for reproducibility
+    random_state = config["data"].get("random_seed", 42)
+
+    # First split: train vs (val + test)
+    train_df, temp_df = train_test_split(
+        df, test_size=(val_ratio + test_ratio), random_state=random_state, shuffle=True
+    )
+
+    # Second split: val vs test
+    val_size_adjusted = val_ratio / (val_ratio + test_ratio)
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=(1 - val_size_adjusted),
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    print(f"\n✓ Data split complete:")
+    print(f"   Train: {len(train_df):,} samples")
+    print(f"   Val:   {len(val_df):,} samples")
+    print(f"   Test:  {len(test_df):,} samples")
+
+    return train_df, val_df, test_df
+
+
+# ============================================================================
 # NORMALIZATION
 # ============================================================================
 
 
-def compute_normalization_stats(intermediate_dir: Path) -> Dict:
-    """Compute normalization stats from training parquet files"""
+def compute_normalization_stats(
+    train_df: pd.DataFrame, norm_method: str = "zscore"
+) -> Dict:
+    """
+    Compute normalization stats from training data only
 
-    print("\n📊 Computing normalization statistics...")
+    Args:
+        train_df: Training DataFrame
+        norm_method: 'zscore' or 'minmax'
 
-    # Find all training parquet files (from MPI ranks)
-    train_files = sorted(intermediate_dir.glob("train_rank*.parquet"))
+    Returns:
+        Dictionary with normalization parameters
+    """
+    print(f"\n📊 Computing normalization statistics ({norm_method})...")
+    print(f"   Training samples: {len(train_df)}")
 
-    if len(train_files) == 0:
-        # Fallback to single file (non-MPI mode)
-        single_file = intermediate_dir / "train.parquet"
-        if single_file.exists():
-            train_files = [single_file]
-        else:
-            raise FileNotFoundError("No training parquet files found")
-
-    print(f"   Loading {len(train_files)} file(s)...")
-
-    # Load and concatenate all training files
-    dfs = [pd.read_parquet(f) for f in train_files]
-    df = pd.concat(dfs, ignore_index=True)
-
-    print(f"   Total training samples: {len(df)}")
-
-    def get_stats(feature_list):
-        """Get mean/std/min/max for list of features"""
+    def get_stats(feature_list, method="zscore"):
+        """Get normalization stats for list of features"""
         arrays = np.array(feature_list.tolist())
 
-        # Handle NaNs
-        mean = np.nanmean(arrays, axis=0).tolist()
-        std = np.nanstd(arrays, axis=0).tolist()
-        min_vals = np.nanmin(arrays, axis=0).tolist()
-        max_vals = np.nanmax(arrays, axis=0).tolist()
+        if method == "zscore":
+            # Z-score normalization: (x - mean) / std
+            mean = np.nanmean(arrays, axis=0).tolist()
+            std = np.nanstd(arrays, axis=0).tolist()
 
-        return {"mean": mean, "std": std, "min": min_vals, "max": max_vals}
+            # Replace zero std with 1.0 (constant features)
+            std = [s if s > 1e-8 else 1.0 for s in std]
+
+            return {"method": "zscore", "mean": mean, "std": std}
+
+        elif method == "minmax":
+            # Min-Max normalization: (x - min) / (max - min)
+            # Maps to [0, 1] range
+            min_vals = np.nanmin(arrays, axis=0).tolist()
+            max_vals = np.nanmax(arrays, axis=0).tolist()
+
+            # Handle constant features
+            ranges = [
+                mx - mn if abs(mx - mn) > 1e-8 else 1.0
+                for mn, mx in zip(min_vals, max_vals)
+            ]
+
+            return {
+                "method": "minmax",
+                "min": min_vals,
+                "max": max_vals,
+                "range": ranges,
+            }
+
+        else:
+            raise ValueError(f"Unknown normalization method: {method}")
 
     stats = {
-        "input_params": get_stats(df["input_params"]),
-        "microstructure_outputs": get_stats(df["microstructure_outputs"]),
-        "performance_outputs": get_stats(df["performance_outputs"]),
+        "normalization_method": norm_method,
+        "input_params": get_stats(train_df["input_params"], norm_method),
+        "microstructure_outputs": get_stats(
+            train_df["microstructure_outputs"], norm_method
+        ),
+        "performance_outputs": get_stats(train_df["performance_outputs"], norm_method),
     }
 
     print(f"✅ Statistics computed\n")
@@ -88,7 +167,7 @@ def compute_normalization_stats(intermediate_dir: Path) -> Dict:
 
 
 # ============================================================================
-# PROCESSING FUNCTIONS (MODULE LEVEL - PICKLABLE)
+# PROCESSING FUNCTIONS
 # ============================================================================
 
 
@@ -96,23 +175,39 @@ def decompress_image(compressed_bytes: bytes, shape: List[int]) -> np.ndarray:
     """Decompress image from bytes"""
     decompressed = zlib.decompress(compressed_bytes)
     image = np.frombuffer(decompressed, dtype=np.uint8).reshape(shape)
-    return image.astype(np.float32)
+    return image.astype(np.float32) / 255.0  # Normalize images to [0, 1]
 
 
 def normalize_features(features: np.ndarray, stats: Dict) -> np.ndarray:
-    """Normalize using z-score"""
-    mean = np.array(stats["mean"], dtype=np.float32)
-    std = np.array(stats["std"], dtype=np.float32)
-    std = np.where(std < 1e-8, 1.0, std)
-    return (features - mean) / std
+    """
+    Normalize features using computed statistics
+
+    Args:
+        features: Input features array
+        stats: Statistics dict with normalization parameters
+
+    Returns:
+        Normalized features
+    """
+    method = stats.get("method", "zscore")
+
+    if method == "zscore":
+        mean = np.array(stats["mean"], dtype=np.float32)
+        std = np.array(stats["std"], dtype=np.float32)
+        return (features - mean) / std
+
+    elif method == "minmax":
+        min_vals = np.array(stats["min"], dtype=np.float32)
+        ranges = np.array(stats["range"], dtype=np.float32)
+        return (features - min_vals) / ranges
+
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
 
 
 def process_sample(sample_tuple: Tuple[Dict, Dict]) -> Dict:
     """
     Process one sample (row + norm_stats packaged together)
-
-    This function receives both the data and normalization stats as a tuple,
-    making it fully self-contained and picklable on both macOS and Linux.
 
     Args:
         sample_tuple: (row_dict, norm_stats)
@@ -152,37 +247,18 @@ def process_sample(sample_tuple: Tuple[Dict, Dict]) -> Dict:
 # ============================================================================
 
 
-def optimize_split(split_name: str, config: Dict, paths: Dict, norm_stats: Dict):
-    """Optimize one split using multi-worker processing (cross-platform)"""
+def optimize_split(
+    split_name: str, df_split: pd.DataFrame, config: Dict, paths: Dict, norm_stats: Dict
+):
+    """Optimize one split using multi-worker processing"""
 
-    intermediate_dir = Path(paths["data"]["output"]["optimized_dir"]) / "intermediate"
-
-    # Find all parquet files for this split (from MPI ranks)
-    parquet_files = sorted(intermediate_dir.glob(f"{split_name}_rank*.parquet"))
-
-    if len(parquet_files) == 0:
-        # Fallback to single file (non-MPI mode)
-        single_file = intermediate_dir / f"{split_name}.parquet"
-        if single_file.exists():
-            parquet_files = [single_file]
-        else:
-            print(f"⚠️  Skipping {split_name}: No parquet files found")
-            return
-
-    # Load all parquet files and concatenate
-    print(f"\n📂 Loading {split_name} parquet files...")
-    print(f"   Found {len(parquet_files)} file(s)")
-
-    dfs = []
-    for pf in parquet_files:
-        dfs.append(pd.read_parquet(pf))
-
-    df = pd.concat(dfs, ignore_index=True)
+    print(f"\n{'='*80}")
+    print(f"🔄 Optimizing {split_name.upper()} split")
+    print(f"{'='*80}")
 
     # Convert to list of dicts
-    rows = df.to_dict("records")
-
-    print(f"✓ Loaded {len(rows)} total rows\n")
+    rows = df_split.to_dict("records")
+    print(f"   Samples: {len(rows):,}")
 
     # Output directory
     output_base = Path(paths["data"]["output"]["optimized_dir"])
@@ -196,28 +272,15 @@ def optimize_split(split_name: str, config: Dict, paths: Dict, norm_stats: Dict)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Detect platform
-    is_macos = platform.system() == "Darwin"
+    # Platform info
     num_workers = config["data"]["num_workers"]
-
-    if is_macos and num_workers > 1:
-        print(f"⚠️  macOS detected with {num_workers} workers")
-        print(
-            f"   Note: macOS spawn mode has overhead. For testing, consider num_workers=1"
-        )
-        print(f"   Production Linux will be much faster with fork mode.\n")
-
-    print(f"{'='*80}")
-    print(f"🔄 Optimizing {split_name.upper()} split")
     print(f"   Platform: {platform.system()}")
-    print(f"   Rows: {len(rows)}")
     print(f"   Output: {output_dir}")
     print(f"   Workers: {num_workers}")
     print(f"   Chunk size: {config['data']['chunk_size']}")
     print(f"{'='*80}\n")
 
-    # Package each row with norm_stats (makes it fully self-contained)
-    # This works on both macOS (spawn) and Linux (fork)
+    # Package each row with norm_stats
     inputs = [(row, norm_stats) for row in rows]
 
     # Optimize with multi-worker support
@@ -240,37 +303,49 @@ def optimize_split(split_name: str, config: Dict, paths: Dict, norm_stats: Dict)
 
 def main():
     print("=" * 80)
-    print("⚡ Step 2: Optimize Dataset from Parquet (Multi-Worker)")
+    print("⚡ Create Optimized Dataset with Train/Val/Test Split")
     print("=" * 80)
-    print(f"Platform: {platform.system()} {platform.machine()}")
+    print(f"Platform: {platform.system()} {platform.machine()}\n")
 
     # Load config
     config, paths = load_config()
     print(f"✓ Configuration loaded")
     print(f"   Workers: {config['data']['num_workers']}")
-    print(f"   Chunk size: {config['data']['chunk_size']}\n")
+    print(f"   Chunk size: {config['data']['chunk_size']}")
 
-    # Compute normalization stats from training set
-    intermediate_dir = Path(paths["data"]["output"]["optimized_dir"]) / "intermediate"
+    # Normalization method
+    norm_method = config["data"].get("normalization_method", "zscore")
+    print(f"   Normalization: {norm_method}")
 
-    norm_stats = compute_normalization_stats(intermediate_dir)
+    # Load pruned data
+    pruned_file = Path("data") / "intermediate_pruned.parquet"
+    print(f"\n📂 Loading pruned data from: {pruned_file}")
+
+    if not pruned_file.exists():
+        raise FileNotFoundError(f"Pruned data not found: {pruned_file}")
+
+    df_full = pd.read_parquet(pruned_file)
+    print(f"✓ Loaded {len(df_full):,} samples")
+    print(f"  Columns: {list(df_full.columns)}")
+
+    # Split data into train/val/test
+    train_df, val_df, test_df = split_data(df_full, config)
+
+    # Compute normalization stats from training data only
+    norm_stats = compute_normalization_stats(train_df, norm_method)
 
     # Validate normalization stats
-    print("📋 Normalization Statistics Summary:")
-    print(f"   Input features: {len(norm_stats['input_params']['mean'])}")
+    print("\n📋 Normalization Statistics Summary:")
+    print(f"   Method: {norm_stats['normalization_method']}")
     print(
-        f"   Microstructure outputs: {len(norm_stats['microstructure_outputs']['mean'])}"
+        f"   Input features: {len(norm_stats['input_params'].get('mean', norm_stats['input_params'].get('min', [])))} "
     )
-    print(f"   Performance outputs: {len(norm_stats['performance_outputs']['mean'])}")
-
-    # Check for issues
-    input_stds = np.array(norm_stats["input_params"]["std"])
-    if np.any(input_stds == 0):
-        print(
-            f"   ⚠️  Warning: {np.sum(input_stds == 0)} input features have zero std (constant values)"
-        )
-
-    print()
+    print(
+        f"   Microstructure outputs: {len(norm_stats['microstructure_outputs'].get('mean', norm_stats['microstructure_outputs'].get('min', [])))}"
+    )
+    print(
+        f"   Performance outputs: {len(norm_stats['performance_outputs'].get('mean', norm_stats['performance_outputs'].get('min', [])))}"
+    )
 
     # Save normalization stats
     output_base = Path(paths["data"]["output"]["optimized_dir"])
@@ -279,11 +354,12 @@ def main():
     with open(stats_path, "w") as f:
         json.dump(norm_stats, f, indent=2)
 
-    print(f"💾 Normalization stats saved: {stats_path}\n")
+    print(f"\n💾 Normalization stats saved: {stats_path}\n")
 
     # Optimize each split
-    for split_name in ["train", "val", "test"]:
-        optimize_split(split_name, config, paths, norm_stats)
+    optimize_split("train", train_df, config, paths, norm_stats)
+    optimize_split("val", val_df, config, paths, norm_stats)
+    optimize_split("test", test_df, config, paths, norm_stats)
 
     # Final summary
     print("=" * 80)
@@ -291,23 +367,20 @@ def main():
     print("=" * 80)
     print(f"📁 Output structure:")
     print(f"   {output_base}/")
-    print(f"   ├── train/          (training data chunks)")
-    print(f"   ├── val/            (validation data chunks)")
-    print(f"   ├── test/           (test data chunks)")
+    print(f"   ├── train/          ({len(train_df):,} samples)")
+    print(f"   ├── val/            ({len(val_df):,} samples)")
+    print(f"   ├── test/           ({len(test_df):,} samples)")
     print(f"   └── {paths['data']['output']['stats_file']}")
     print("=" * 80)
 
-    # Platform-specific notes
-    if platform.system() == "Darwin":
-        print("\n📝 macOS Testing Notes:")
-        print("   - For faster testing, use num_workers: 1 in config.yml")
-        print("   - Production Linux will be 10-50x faster with fork mode")
-        print("=" * 80)
-    else:
-        print("\n🚀 Linux Production Mode")
-        print("   - Fork mode enabled for maximum performance")
-        print("   - Scale to 256+ workers for large datasets")
-        print("=" * 80)
+    # Data quality summary
+    print(f"\n📊 Data Quality Summary:")
+    print(f"   Total samples: {len(df_full):,}")
+    print(f"   Train: {len(train_df):,} ({len(train_df)/len(df_full)*100:.1f}%)")
+    print(f"   Val:   {len(val_df):,} ({len(val_df)/len(df_full)*100:.1f}%)")
+    print(f"   Test:  {len(test_df):,} ({len(test_df)/len(df_full)*100:.1f}%)")
+    print(f"   Normalization: {norm_method}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":

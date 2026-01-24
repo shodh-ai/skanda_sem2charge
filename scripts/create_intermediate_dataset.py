@@ -150,13 +150,11 @@ def get_sample_data(
         total_cycles = 0
 
     performance = [
-        safe_float(parquet_row.get("nominal_capacity_Ah", None)),
         safe_float(parquet_row.get("eol_cycle_measured", None)),
         initial_cap,
         final_cap,
         retention,
         float(total_cycles),
-        safe_float(parquet_row.get("final_RUL", np.nan)),
     ]
 
     return input_params, microstructure, performance
