@@ -1,10 +1,10 @@
 # Training hyperparameters
 training:
-  epochs: 10
+  epochs: 100
   batch_size: 16
-  num_workers: 4
+  num_workers: 24
   accelerator: "gpu"
-  devices: -1 # Use all available GPUs
+  devices: -1
   precision: 16
   gradient_clip_val: 1.0
 

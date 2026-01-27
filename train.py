@@ -1,3 +1,4 @@
+import torch
 import yaml
 import argparse
 from pathlib import Path
@@ -8,14 +9,43 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
 )
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.utilities import rank_zero_only
 
 from src.battery_datamodule import BatteryDataModule
 from src.lightning_model import BatteryLightningModel
 
 
+@rank_zero_only
+def print_config(args, train_config, paths_config, total_params):
+    print("=" * 80)
+    print("🔋 Training Battery Prediction Model")
+    print("=" * 80)
+    print(f"Experiment: {args.experiment_name}")
+    print(f"Epochs: {train_config['training']['epochs']}")
+    print(f"Batch size (per GPU): {train_config['training']['batch_size']}")
+    print(
+        f"Total Effective Batch size: {train_config['training']['batch_size'] * train_config['training'].get('devices', 1) if train_config['training'].get('devices') != -1 else 'Dynamic'}"
+    )
+    print(f"Data dir: {paths_config['data']['output']['optimized_dir']}")
+    print(f"Total parameters: {total_params:,}")
+    print("=" * 80)
+
+
+@rank_zero_only
+def print_completion(checkpoint_path, log_dir):
+    print("\n" + "=" * 80)
+    print("✅ Training Complete!")
+    print("=" * 80)
+    print(f"Best checkpoint: {checkpoint_path}")
+    print(f"Logs: {log_dir}")
+    print("=" * 80)
+
+
 def main(args):
     # Seed
     pl.seed_everything(42, workers=True)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.set_float32_matmul_precision("medium")
 
     # Load configs
     with open("configs/paths.yml", "r") as f:
@@ -23,15 +53,6 @@ def main(args):
 
     with open("configs/train_config.yml", "r") as f:
         train_config = yaml.safe_load(f)
-
-    print("=" * 80)
-    print("🔋 Training Battery Prediction Model")
-    print("=" * 80)
-    print(f"Experiment: {args.experiment_name}")
-    print(f"Epochs: {train_config['training']['epochs']}")
-    print(f"Batch size: {train_config['training']['batch_size']}")
-    print(f"Data dir: {paths_config['data']['output']['optimized_dir']}")
-    print("=" * 80)
 
     # Data
     datamodule = BatteryDataModule(
@@ -45,8 +66,7 @@ def main(args):
 
     # Count params
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print("=" * 80)
+    print_config(args, train_config, paths_config, total_params)
 
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -76,9 +96,10 @@ def main(args):
         devices=train_config["training"]["devices"],
         precision=train_config["training"]["precision"],
         gradient_clip_val=train_config["training"]["gradient_clip_val"],
+        strategy="ddp",
         callbacks=[checkpoint_callback, early_stopping, lr_monitor],
         logger=logger,
-        deterministic=True,
+        deterministic="warn",
         log_every_n_steps=10,
     )
 
@@ -88,12 +109,7 @@ def main(args):
     # Test
     trainer.test(model, datamodule, ckpt_path="best")
 
-    print("\n" + "=" * 80)
-    print("✅ Training Complete!")
-    print("=" * 80)
-    print(f"Best checkpoint: {checkpoint_callback.best_model_path}")
-    print(f"Logs: {logger.log_dir}")
-    print("=" * 80)
+    print_completion(checkpoint_callback.best_model_path, logger.log_dir)
 
 
 if __name__ == "__main__":
