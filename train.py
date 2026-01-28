@@ -10,6 +10,8 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities import rank_zero_only
+import json
+from datetime import datetime
 
 from src.battery_datamodule import BatteryDataModule
 from src.lightning_model import BatteryLightningModel
@@ -32,12 +34,50 @@ def print_config(args, train_config, paths_config, total_params):
 
 
 @rank_zero_only
-def print_completion(checkpoint_path, log_dir):
+def save_test_report(model, experiment_dir, logger):
+    """Save comprehensive test report to JSON"""
+    if not hasattr(model, "test_report"):
+        print("⚠️  No test report available")
+        return
+
+    # Add metadata
+    report = model.test_report.copy()
+    report["metadata"] = {
+        "experiment_name": experiment_dir.name,
+        "timestamp": datetime.now().isoformat(),
+        "tensorboard_log_dir": str(logger.log_dir),
+    }
+
+    # Save to experiment directory
+    report_dir = experiment_dir / "test_results"
+    report_dir.mkdir(exist_ok=True)
+
+    # Save with version number
+    version_num = logger.version
+    report_path = report_dir / f"test_report_version_{version_num}.json"
+
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    # Also save as latest
+    latest_path = report_dir / "test_report_latest.json"
+    with open(latest_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"\n💾 Test report saved:")
+    print(f"  ├─ {report_path}")
+    print(f"  └─ {latest_path}\n")
+
+
+@rank_zero_only
+def print_completion(checkpoint_path, log_dir, report_path):
     print("\n" + "=" * 80)
     print("✅ Training Complete!")
     print("=" * 80)
     print(f"Best checkpoint: {checkpoint_path}")
     print(f"Logs: {log_dir}")
+    if report_path:
+        print(f"Test report: {report_path}")
     print("=" * 80)
 
 
@@ -68,9 +108,12 @@ def main(args):
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print_config(args, train_config, paths_config, total_params)
 
+    # Setup experiment directory
+    experiment_dir = Path("experiments") / args.experiment_name
+
     # Callbacks
     checkpoint_callback = ModelCheckpoint(
-        dirpath=Path("experiments") / args.experiment_name / "checkpoints",
+        dirpath=experiment_dir / "checkpoints",
         filename="epoch{epoch:02d}-val_loss{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
@@ -106,10 +149,21 @@ def main(args):
     # Train
     trainer.fit(model, datamodule)
 
-    # Test
+    # Test with best model
+    print("\n" + "=" * 80)
+    print("🧪 Running comprehensive testing on best model...")
+    print("=" * 80)
+
     trainer.test(model, datamodule, ckpt_path="best")
 
-    print_completion(checkpoint_callback.best_model_path, logger.log_dir)
+    # Save test report
+    save_test_report(model, experiment_dir, logger)
+
+    # Print completion
+    report_path = (
+        experiment_dir / "test_results" / f"test_report_version_{logger.version}.json"
+    )
+    print_completion(checkpoint_callback.best_model_path, logger.log_dir, report_path)
 
 
 if __name__ == "__main__":
