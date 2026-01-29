@@ -7,8 +7,8 @@ MPI-enabled script to prune intermediate data by:
 4. Saving to: data/intermediate_pruned.parquet
 
 Usage:
-    Single process: python prune_intermediate_data.py
-    MPI parallel:   mpirun -n 4 python prune_intermediate_data.py
+    Single process: python scripts/prune_intermediate_data.py
+    MPI parallel:   mpirun -n 4 python scripts/prune_intermediate_data.py
 """
 
 import pandas as pd
@@ -28,22 +28,30 @@ except ImportError:
 
 
 # ============================================================================
-# FEATURE DEFINITIONS
+# FEATURE DEFINITIONS (MUST MATCH create_intermediate_dataset.py - 17 total)
 # ============================================================================
 
 INPUT_FEATURES = [
-    "SEI_kinetic_rate",
-    "Electrolyte_diffusivity",
-    "Initial_conc_electrolyte",
-    "Separator_porosity",
-    "Separator_Bruggeman_electrolyte",
-    "Separator_Bruggeman",
-    "Positive_particle_radius",
-    "Negative_particle_radius",
-    "Positive_electrode_thickness",
-    "Negative_electrode_thickness",
+    # Original 10 features (with exact names from parquet)
+    "input_SEI kinetic rate constant [m.s-1]",
+    "input_Electrolyte diffusivity [m2.s-1]",
+    "input_Initial concentration in electrolyte [mol.m-3]",
+    "input_Separator porosity",
+    "input_Positive particle radius [m]",
+    "input_Negative particle radius [m]",
+    "input_Positive electrode thickness [m]",
+    "input_Negative electrode thickness [m]",
+    # New 7 degradation features (with exact names from parquet)
+    "input_Outer SEI solvent diffusivity [m2.s-1]",
+    "input_Dead lithium decay constant [s-1]",
+    "input_Lithium plating kinetic rate constant [m.s-1]",
+    "input_Negative electrode LAM constant proportional term [s-1]",
+    "input_Negative electrode cracking rate",
+    "input_Outer SEI partial molar volume [m3.mol-1]",
+    "input_SEI growth activation energy [J.mol-1]",
 ]
 
+# Microstructure features from tau_results CSV + bruggeman from parquet
 MICROSTRUCTURE_FEATURES = [
     "D_eff",
     "porosity_measured",
@@ -51,13 +59,17 @@ MICROSTRUCTURE_FEATURES = [
     "bruggeman_derived",
 ]
 
+# Performance features from parquet
 PERFORMANCE_FEATURES = [
+    "nominal_capacity_Ah",
     "eol_cycle_measured",
     "initial_capacity_Ah",
     "final_capacity_Ah",
     "capacity_retention_percent",
     "total_cycles",
+    "final_RUL",
 ]
+
 
 # ============================================================================
 # PRUNING CONFIGURATION
@@ -73,16 +85,24 @@ OUTLIER_CONFIG = {
     "iqr_multiplier": 1.5,  # Standard IQR multiplier (1.5 for outliers, 3.0 for extreme outliers)
     # Features to check for outliers (exclude constant features)
     "features_to_check": [
-        # Input features (exclude Initial_conc_electrolyte - it's constant)
-        "SEI_kinetic_rate",
-        "Electrolyte_diffusivity",
-        "Separator_porosity",
-        "Separator_Bruggeman_electrolyte",
-        "Separator_Bruggeman",
-        "Positive_particle_radius",
-        "Negative_particle_radius",
-        "Positive_electrode_thickness",
-        "Negative_electrode_thickness",
+        # Input features (check all that vary - exclude constants if any)
+        "input_SEI kinetic rate constant [m.s-1]",
+        "input_Electrolyte diffusivity [m2.s-1]",
+        # "input_Initial concentration in electrolyte [mol.m-3]",  # Often constant
+        "input_Separator porosity",
+        # Skip the Bruggeman coefficients if they're constant or causing issues
+        "input_Positive particle radius [m]",
+        "input_Negative particle radius [m]",
+        "input_Positive electrode thickness [m]",
+        "input_Negative electrode thickness [m]",
+        # New degradation features
+        "input_Outer SEI solvent diffusivity [m2.s-1]",
+        "input_Dead lithium decay constant [s-1]",
+        "input_Lithium plating kinetic rate constant [m.s-1]",
+        "input_Negative electrode LAM constant proportional term [s-1]",
+        "input_Negative electrode cracking rate",
+        "input_Outer SEI partial molar volume [m3.mol-1]",
+        "input_SEI growth activation energy [J.mol-1]",
         # Microstructure features (all)
         "D_eff",
         "porosity_measured",
@@ -92,6 +112,7 @@ OUTLIER_CONFIG = {
         "initial_capacity_Ah",
         "final_capacity_Ah",
         "capacity_retention_percent",
+        "total_cycles",
     ],
 }
 
@@ -181,6 +202,16 @@ def expand_dataframe(df_local, rank):
 
     # Extract arrays
     input_arrays = np.array(df_local["input_params"].tolist())
+
+    # Check if we have the right number of features
+    if rank == 0:
+        print(f"  Input array shape: {input_arrays.shape}")
+        print(f"  Expected features: {len(INPUT_FEATURES)}")
+        if input_arrays.shape[1] != len(INPUT_FEATURES):
+            print(
+                f"  ⚠️  WARNING: Mismatch! Array has {input_arrays.shape[1]} features but we have {len(INPUT_FEATURES)} names"
+            )
+
     df_inputs = pd.DataFrame(input_arrays, columns=INPUT_FEATURES)
 
     micro_arrays = np.array(df_local["microstructure_outputs"].tolist())
@@ -202,6 +233,12 @@ def expand_dataframe(df_local, rank):
 
     if rank == 0:
         print(f"Rank {rank} expanded dataset shape: {df_expanded.shape}")
+        print(f"  Input features: {len(INPUT_FEATURES)}")
+        print(f"  Microstructure features: {len(MICROSTRUCTURE_FEATURES)}")
+        print(f"  Performance features: {len(PERFORMANCE_FEATURES)}")
+        print(
+            f"  Total features: {len(INPUT_FEATURES) + len(MICROSTRUCTURE_FEATURES) + len(PERFORMANCE_FEATURES)}"
+        )
 
     return df_expanded
 
@@ -269,6 +306,17 @@ def remove_nans(df, rank):
 
     # Check for NaNs in all parameter columns
     all_param_cols = INPUT_FEATURES + MICROSTRUCTURE_FEATURES + PERFORMANCE_FEATURES
+
+    # Count NaNs per column for reporting
+    if rank == 0:
+        nan_counts = df[all_param_cols].isnull().sum()
+        nan_cols = nan_counts[nan_counts > 0].sort_values(ascending=False)
+        if len(nan_cols) > 0:
+            print(f"\n  Columns with NaN values:")
+            for col, count in nan_cols.items():
+                pct = count / len(df) * 100
+                print(f"    {col:70s}: {count:6,} NaNs ({pct:5.1f}%)")
+
     df_clean = df.dropna(subset=all_param_cols)
     final_count = len(df_clean)
     removed_count = initial_count - final_count
@@ -276,7 +324,7 @@ def remove_nans(df, rank):
     stats = {"initial": initial_count, "final": final_count, "removed": removed_count}
 
     if rank == 0:
-        print(f"\nRank {rank} - NaN Removal:")
+        print(f"\nRank {rank} - NaN Removal Summary:")
         print(f"  Initial samples:     {initial_count:,}")
         print(f"  After NaN removal:   {final_count:,}")
         print(
@@ -398,7 +446,7 @@ def remove_outliers(df, rank, config=OUTLIER_CONFIG):
                     pct = count / initial_count * 100
                     bounds = outlier_bounds[feat]
                     print(
-                        f"    {feat:40s}: {count:6,} ({pct:5.2f}%) | Bounds: [{bounds['lower']:.6e}, {bounds['upper']:.6e}]"
+                        f"    {feat:60s}: {count:6,} ({pct:5.2f}%) | Bounds: [{bounds['lower']:.6e}, {bounds['upper']:.6e}]"
                     )
 
     return df_clean, stats
@@ -440,7 +488,8 @@ def gather_and_print_stats(
         print(f"  Initial samples:        {tau_initial:,}")
         print(f"  Samples passing filter: {tau_final:,}")
         print(f"  Samples removed:        {tau_removed:,}")
-        print(f"  Retention rate:         {tau_final/tau_initial*100:.2f}%")
+        if tau_initial > 0:
+            print(f"  Retention rate:         {tau_final/tau_initial*100:.2f}%")
 
         # Step 2: NaN Removal
         nan_initial = sum(s.get("initial", 0) for s in all_nan_stats)
@@ -452,7 +501,8 @@ def gather_and_print_stats(
         print(f"  Initial samples:        {nan_initial:,}")
         print(f"  Samples without NaNs:   {nan_final:,}")
         print(f"  Samples removed:        {nan_removed:,}")
-        print(f"  Retention rate:         {nan_final/nan_initial*100:.2f}%")
+        if nan_initial > 0:
+            print(f"  Retention rate:         {nan_final/nan_initial*100:.2f}%")
 
         # Step 3: Outlier Removal
         if OUTLIER_CONFIG["enabled"] and all_outlier_stats[0]:
@@ -466,7 +516,10 @@ def gather_and_print_stats(
             print(f"  Initial samples:        {outlier_initial:,}")
             print(f"  Samples without outliers: {outlier_final:,}")
             print(f"  Samples removed:        {outlier_removed:,}")
-            print(f"  Retention rate:         {outlier_final/outlier_initial*100:.2f}%")
+            if outlier_initial > 0:
+                print(
+                    f"  Retention rate:         {outlier_final/outlier_initial*100:.2f}%"
+                )
 
             # Aggregate outlier counts across all ranks
             total_outlier_counts = {}
@@ -484,8 +537,10 @@ def gather_and_print_stats(
                 print(f"\n  Top features contributing to outliers:")
                 for feat, count in sorted_outliers[:10]:
                     if count > 0:
-                        pct = count / outlier_initial * 100
-                        print(f"    {feat:40s}: {count:6,} ({pct:5.2f}%)")
+                        pct = (
+                            count / outlier_initial * 100 if outlier_initial > 0 else 0
+                        )
+                        print(f"    {feat:60s}: {count:6,} ({pct:5.2f}%)")
 
             final_total = outlier_final
         else:
@@ -498,18 +553,20 @@ def gather_and_print_stats(
         print(f"  Initial samples:        {tau_initial:,}")
         print(f"  Final clean samples:    {final_total:,}")
         print(f"  Total samples removed:  {tau_initial - final_total:,}")
-        print(f"  Overall retention:      {final_total/tau_initial*100:.2f}%")
+        if tau_initial > 0:
+            print(f"  Overall retention:      {final_total/tau_initial*100:.2f}%")
         print(f"\n  Breakdown of removed samples:")
-        print(
-            f"    Tau factor > {tau_max}:    {tau_removed:,} ({tau_removed/tau_initial*100:.2f}%)"
-        )
-        print(
-            f"    NaN values:           {nan_removed:,} ({nan_removed/tau_initial*100:.2f}%)"
-        )
-        if OUTLIER_CONFIG["enabled"] and all_outlier_stats[0]:
+        if tau_initial > 0:
             print(
-                f"    Statistical outliers: {outlier_removed:,} ({outlier_removed/tau_initial*100:.2f}%)"
+                f"    Tau factor > {tau_max}:    {tau_removed:,} ({tau_removed/tau_initial*100:.2f}%)"
             )
+            print(
+                f"    NaN values:           {nan_removed:,} ({nan_removed/tau_initial*100:.2f}%)"
+            )
+            if OUTLIER_CONFIG["enabled"] and all_outlier_stats[0]:
+                print(
+                    f"    Statistical outliers: {outlier_removed:,} ({outlier_removed/tau_initial*100:.2f}%)"
+                )
         print("=" * 80)
 
 
@@ -526,9 +583,11 @@ def gather_pruned_data(df_pruned_local, df_local, comm, rank):
         all_dfs = comm.gather(df_export_local, root=0)
 
         if rank == 0:
-            df_pruned_full = pd.concat(
-                [df for df in all_dfs if len(df) > 0], ignore_index=True
-            )
+            all_dfs_filtered = [df for df in all_dfs if len(df) > 0]
+            if len(all_dfs_filtered) > 0:
+                df_pruned_full = pd.concat(all_dfs_filtered, ignore_index=True)
+            else:
+                df_pruned_full = pd.DataFrame()
             return df_pruned_full
         else:
             return None
@@ -543,7 +602,11 @@ def save_pruned_data(df_pruned_full, output_file, rank):
         return
 
     if df_pruned_full is None or len(df_pruned_full) == 0:
-        print("Warning: No data to save!")
+        print("\n⚠️  WARNING: No data to save! All rows were filtered out.")
+        print("    Please check:")
+        print("    1. Are there missing features in your parquet files?")
+        print("    2. Do you have too many NaN values?")
+        print("    3. Consider relaxing outlier removal settings")
         return
 
     output_path = Path(output_file)
@@ -579,6 +642,13 @@ def main():
         print("=" * 80)
         print(f"MPI Processes: {size}")
         print(f"MPI Available: {MPI_AVAILABLE}")
+        print(f"\nFeature Configuration:")
+        print(f"  Input features: {len(INPUT_FEATURES)}")
+        print(f"  Microstructure features: {len(MICROSTRUCTURE_FEATURES)}")
+        print(f"  Performance features: {len(PERFORMANCE_FEATURES)}")
+        print(
+            f"  Total features: {len(INPUT_FEATURES) + len(MICROSTRUCTURE_FEATURES) + len(PERFORMANCE_FEATURES)}"
+        )
         print(f"\nPruning Configuration:")
         print(f"  Step 1 - Tau factor max: {TAU_FACTOR_MAX}")
         print(f"  Step 2 - NaN removal: Enabled")
@@ -661,17 +731,18 @@ def main():
     save_pruned_data(df_pruned_full, output_file, rank)
 
     if rank == 0:
-        print("\n" + "=" * 80)
-        print("🎉 PRUNING COMPLETE!")
-        print("=" * 80)
-        print(f"\nData Quality Pipeline Executed:")
-        print(f"  1. ✓ Physical constraint (tau_factor <= {TAU_FACTOR_MAX})")
-        print(f"  2. ✓ Data quality (NaN removal)")
-        print(f"  3. ✓ Statistical cleanup (outlier removal)")
-        print(f"\nNext Steps:")
-        print(f"  → Run: python create_optimized_dataset.py")
-        print(f"  → This will create train/val/test splits with normalization")
-        print("=" * 80)
+        if df_pruned_full is not None and len(df_pruned_full) > 0:
+            print("\n" + "=" * 80)
+            print("🎉 PRUNING COMPLETE!")
+            print("=" * 80)
+            print(f"\nData Quality Pipeline Executed:")
+            print(f"  1. ✓ Physical constraint (tau_factor <= {TAU_FACTOR_MAX})")
+            print(f"  2. ✓ Data quality (NaN removal)")
+            print(f"  3. ✓ Statistical cleanup (outlier removal)")
+            print(f"\nNext Steps:")
+            print(f"  → Run: python scripts/optimise_from_parquet.py")
+            print(f"  → This will create train/val/test splits with normalization")
+            print("=" * 80)
 
 
 if __name__ == "__main__":

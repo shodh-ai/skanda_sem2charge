@@ -19,6 +19,7 @@ import sys
 
 warnings.filterwarnings("ignore")
 
+
 # ============================================================================
 # MPI SETUP
 # ============================================================================
@@ -33,6 +34,7 @@ except ImportError:
     print("❌ ERROR: mpi4py not found!")
     print("Install with: pip install mpi4py")
     sys.exit(1)
+
 
 # ============================================================================
 # CONFIGURATION
@@ -116,13 +118,13 @@ def get_sample_data(
         raise ValueError(f"Param {param_id} not found in sample {sample_id}")
     parquet_row = param_rows.iloc[0]
 
-    # Extract input params (allow NaN)
+    # Extract input params from parquet (15 features that actually exist)
     input_params = []
     for feat in input_features:
         val = parquet_row.get(feat, None)
         input_params.append(safe_float(val))
 
-    # Extract microstructure outputs (allow NaN)
+    # Extract microstructure outputs
     microstructure = [
         safe_float(tau_row.get("D_eff", None)),
         safe_float(tau_row.get("porosity_measured", None)),
@@ -150,11 +152,13 @@ def get_sample_data(
         total_cycles = 0
 
     performance = [
+        safe_float(parquet_row.get("nominal_capacity_Ah", None)),
         safe_float(parquet_row.get("eol_cycle_measured", None)),
         initial_cap,
         final_cap,
         retention,
         float(total_cycles),
+        safe_float(parquet_row.get("final_RUL", None)),
     ]
 
     return input_params, microstructure, performance
@@ -165,18 +169,44 @@ def get_sample_data(
 # ============================================================================
 
 
-def discover_samples(config: Dict, paths: Dict) -> List[int]:
-    """Find all available samples"""
+def discover_samples(tau_df: pd.DataFrame, paths: Dict) -> List[int]:
+    """
+    Find all available samples by reading IDs from tau_results CSV
+    and verifying TIFF files exist
+    """
     base_dir = Path(paths["data"]["base_dir"])
     images_dir = base_dir / paths["data"]["input"]["images_dir"]
     image_pattern = paths["data"]["input"]["image_pattern"]
 
-    available = []
-    for sample_id in range(config["data"]["total_samples"]):
-        if (images_dir / image_pattern.format(sample_id)).exists():
-            available.append(sample_id)
+    if rank == 0:
+        print(f"\n🔍 Discovering samples from tau_results.csv...")
 
-    return available
+    # Get all sample IDs from tau_results
+    all_sample_ids = tau_df["id"].unique().tolist()
+
+    if rank == 0:
+        print(f"   Found {len(all_sample_ids)} unique sample IDs in CSV")
+        print(f"   Sample ID range: {min(all_sample_ids)} - {max(all_sample_ids)}")
+
+    # Verify which samples have corresponding TIFF files
+    available = []
+    missing = []
+
+    for sample_id in all_sample_ids:
+        img_path = images_dir / image_pattern.format(sample_id)
+        if img_path.exists():
+            available.append(sample_id)
+        else:
+            missing.append(sample_id)
+
+    if rank == 0:
+        print(f"   ✓ {len(available)} samples have TIFF files")
+        if len(missing) > 0:
+            print(
+                f"   ⚠️  {len(missing)} samples missing TIFF files: {missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+
+    return sorted(available)
 
 
 def distribute_samples(sample_ids: List[int], rank: int, world_size: int) -> List[int]:
@@ -194,6 +224,12 @@ def create_intermediate_parquet(
 ):
     """Create compressed intermediate parquet (MPI-parallel)"""
 
+    # Early exit if no samples
+    if len(sample_ids) == 0:
+        if rank == 0:
+            print("\n❌ No samples to process. Exiting.")
+        return
+
     base_dir = Path(paths["data"]["base_dir"])
     images_dir = base_dir / paths["data"]["input"]["images_dir"]
     image_pattern = paths["data"]["input"]["image_pattern"]
@@ -207,7 +243,10 @@ def create_intermediate_parquet(
     output_file = output_dir / f"data_rank{rank:04d}.parquet"
 
     num_params = config["data"]["params_per_sample"]
+
+    # All input features from parquet (15 features that actually exist)
     input_features = config["data"]["input_features"]
+
     pore_value = config["data"]["image"]["pore_value"]
 
     # Distribute samples
@@ -217,10 +256,15 @@ def create_intermediate_parquet(
         print(f"\n{'='*80}")
         print(f"📦 Creating Intermediate Dataset")
         print(f"   Total samples: {len(sample_ids)}")
+        print(f"   Sample ID range: {min(sample_ids)} - {max(sample_ids)}")
         print(f"   Params per sample: {num_params}")
         print(f"   Expected total: {len(sample_ids) * num_params}")
         print(f"   MPI ranks: {world_size}")
         print(f"   Samples per rank: ~{len(sample_ids) // world_size}")
+        print(f"   Input features: {len(input_features)}")
+        print(f"   Feature names:")
+        for i, feat in enumerate(input_features, 1):
+            print(f"      {i:2d}. {feat}")
         print(f"   Output: {output_dir}")
         print(f"{'='*80}\n")
 
@@ -250,6 +294,8 @@ def create_intermediate_parquet(
             image_shape = list(image.shape)
         except Exception as e:
             error_log["image_compress_failed"] += num_params
+            if rank == 0 and error_log["image_compress_failed"] <= 3:
+                print(f"\n  Error compressing image {sample_id}: {e}")
             continue
 
         # Process all parameter variations
@@ -278,12 +324,17 @@ def create_intermediate_parquet(
 
             except Exception as e:
                 error_log["data_extraction_failed"] += 1
+                # Only print first few errors to avoid spam
+                if error_log["data_extraction_failed"] <= 3 and rank == 0:
+                    print(
+                        f"\n  Error extracting data for sample {sample_id}, param {param_id}: {e}"
+                    )
 
     # Save parquet
     df = pd.DataFrame(rows)
 
-    if len(df) > 0 or rank == 0:
-        total_errors = sum(error_log.values())
+    total_errors = sum(error_log.values())
+    if rank == 0 or len(df) > 0:
         print(f"\n[Rank {rank}] 💾 Saving {len(df)} rows (errors: {total_errors})")
 
     df.to_parquet(output_file, compression="snappy", index=False)
@@ -308,10 +359,13 @@ def create_intermediate_parquet(
 
         print(f"\n{'='*80}")
         print(f"✅ Intermediate Dataset Created!")
-        print(f"   Expected rows: {expected}")
-        print(f"   Created rows: {total_rows}")
-        print(f"   Missing rows: {expected - total_rows}")
-        print(f"   Success rate: {total_rows/expected*100:.2f}%")
+        print(f"   Expected rows: {expected:,}")
+        print(f"   Created rows: {total_rows:,}")
+        print(f"   Missing rows: {expected - total_rows:,}")
+
+        if expected > 0:
+            print(f"   Success rate: {total_rows/expected*100:.2f}%")
+
         print(f"   Total size: {total_size_mb:.1f} MB")
         print(f"   Files: {world_size} parquet files")
 
@@ -319,7 +373,7 @@ def create_intermediate_parquet(
             print(f"\n   ⚠️  Error summary:")
             for error_type, count in total_error_counts.items():
                 if count > 0:
-                    print(f"      {error_type}: {count}")
+                    print(f"      {error_type}: {count:,}")
 
         print(f"   Location: {output_dir}")
         print(f"{'='*80}\n")
@@ -344,34 +398,53 @@ def main():
     if rank == 0:
         print(f"\n✓ Configuration loaded")
 
-    # Discover samples
-    samples = discover_samples(config, paths)
-
-    if rank == 0:
-        print(f"✓ Discovered {len(samples)} samples")
-        print(
-            f"✓ Expected data points: {len(samples) * config['data']['params_per_sample']}\n"
-        )
-
-    # Load CSV
+    # Load CSV files first
     if rank == 0:
         print("📂 Loading CSV metadata...")
 
     base_dir = Path(paths["data"]["base_dir"])
-    tau_results = pd.read_csv(base_dir / paths["data"]["input"]["tau_results_csv"])
+
+    # Load tau results
+    tau_results_path = base_dir / paths["data"]["input"]["tau_results_csv"]
+    if not tau_results_path.exists():
+        if rank == 0:
+            print(f"❌ ERROR: Tau results CSV not found: {tau_results_path}")
+        sys.exit(1)
+    tau_results = pd.read_csv(tau_results_path)
 
     if rank == 0:
-        print(f"✓ Loaded {len(tau_results)} tau results\n")
+        print(f"✓ Loaded {len(tau_results)} tau results from: {tau_results_path.name}")
+        print(f"  Columns: {list(tau_results.columns)}")
+
+    # Discover samples from tau_results CSV
+    samples = discover_samples(tau_results, paths)
+
+    if rank == 0:
+        if len(samples) > 0:
+            print(f"\n✓ Final sample count: {len(samples)}")
+            print(f"✓ Sample IDs: {samples[:10]}{'...' if len(samples) > 10 else ''}")
+            print(
+                f"✓ Expected data points: {len(samples) * config['data']['params_per_sample']:,}\n"
+            )
+        else:
+            print(f"\n❌ No valid samples found!")
 
     # Create intermediate dataset
     create_intermediate_parquet(samples, config, paths, tau_results, rank, world_size)
 
     if rank == 0:
-        print("=" * 80)
-        print("🎉 Intermediate dataset creation complete!")
-        print("=" * 80)
-        print("\nNext step: python scripts/optimize_from_parquet.py")
-        print("=" * 80)
+        if len(samples) > 0:
+            print("=" * 80)
+            print("🎉 Intermediate dataset creation complete!")
+            print("=" * 80)
+            print("\nNext steps:")
+            print("  1. Run: python scripts/prune_intermediate_data.py")
+            print("  2. Then: python scripts/optimise_from_parquet.py")
+            print("=" * 80)
+        else:
+            print("\n" + "=" * 80)
+            print("⚠️  No samples processed - please check configuration")
+            print("=" * 80)
 
 
 if __name__ == "__main__":

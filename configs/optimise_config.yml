@@ -9,6 +9,12 @@ data:
     val: 0.15
     test: 0.15
 
+  # Random seed for reproducibility
+  random_seed: 42
+
+  # Normalization method: 'zscore' or 'minmax'
+  normalization_method: "zscore"
+
   # Optimization settings
   chunk_size: 64
   num_workers: 4
@@ -20,18 +26,24 @@ data:
     binary_pore: 0.0
     binary_solid: 1.0
 
-  # Input features (battery design parameters)
+  # All input features from parquet (17 total)
   input_features:
+    # Original 10 features
     - "input_SEI kinetic rate constant [m.s-1]"
     - "input_Electrolyte diffusivity [m2.s-1]"
     - "input_Initial concentration in electrolyte [mol.m-3]"
     - "input_Separator porosity"
-    - "input_Separator Bruggeman coefficient (electrolyte)"
-    - "input_Separator Bruggeman coefficient"
     - "input_Positive particle radius [m]"
     - "input_Negative particle radius [m]"
     - "input_Positive electrode thickness [m]"
     - "input_Negative electrode thickness [m]"
+    - "input_Outer SEI solvent diffusivity [m2.s-1]"
+    - "input_Dead lithium decay constant [s-1]"
+    - "input_Lithium plating kinetic rate constant [m.s-1]"
+    - "input_Negative electrode LAM constant proportional term [s-1]"
+    - "input_Negative electrode cracking rate"
+    - "input_Outer SEI partial molar volume [m3.mol-1]"
+    - "input_SEI growth activation energy [J.mol-1]"
 
   # Output features
   output_features:
@@ -41,8 +53,10 @@ data:
       - "tau_factor"
       - "bruggeman_derived"
     performance:
+      - "nominal_capacity_Ah"
       - "eol_cycle_measured"
       - "initial_capacity_Ah"
       - "final_capacity_Ah"
       - "capacity_retention_percent"
       - "total_cycles"
+      - "final_RUL"

@@ -9,7 +9,7 @@ data:
     final_results_csv: "output_parameter_sweep/final_results.csv"
     tau_results_csv: "output_parameter_sweep/taufactor_results.csv"
     parquet_dir: "final_pybamm_output"
-    parquet_pattern: "results_rank_{}.parquet"
+    parquet_pattern: "sample_{:04d}.parquet"
 
   # Output data
   output:
