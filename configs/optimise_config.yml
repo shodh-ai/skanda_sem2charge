@@ -1,7 +1,7 @@
 # Dataset split configuration
 data:
   total_samples: 100
-  params_per_sample: 60
+  params_per_sample: 100
 
   # Split ratios
   splits:
@@ -26,7 +26,7 @@ data:
     binary_pore: 0.0
     binary_solid: 1.0
 
-  # All input features from parquet (17 total)
+  # All input features from parquet (15 total)
   input_features:
     - "input_SEI kinetic rate constant [m.s-1]"
     - "input_Electrolyte diffusivity [m2.s-1]"
@@ -52,10 +52,8 @@ data:
       - "tau_factor"
       - "bruggeman_derived"
     performance:
-      - "nominal_capacity_Ah"
-      - "eol_cycle_measured"
-      - "initial_capacity_Ah"
-      - "final_capacity_Ah"
-      - "capacity_retention_percent"
-      - "total_cycles"
-      - "final_RUL"
+      - "projected_cycle_life"
+      - "capacity_fade_rate"
+      - "internal_resistance"
+      - "nominal_capacity"
+      - "energy_density"
