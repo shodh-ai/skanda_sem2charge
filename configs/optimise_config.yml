@@ -28,7 +28,6 @@ data:
 
   # All input features from parquet (17 total)
   input_features:
-    # Original 10 features
     - "input_SEI kinetic rate constant [m.s-1]"
     - "input_Electrolyte diffusivity [m2.s-1]"
     - "input_Initial concentration in electrolyte [mol.m-3]"
