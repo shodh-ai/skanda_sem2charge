@@ -1,7 +1,7 @@
 # Training hyperparameters
 training:
   epochs: 100
-  batch_size: 16
+  batch_size: 32
   num_workers: 24
   accelerator: "gpu"
   devices: -1

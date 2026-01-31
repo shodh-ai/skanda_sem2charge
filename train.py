@@ -12,10 +12,23 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities import rank_zero_only
 import json
 from datetime import datetime
+import warnings
 
 from src.battery_datamodule import BatteryDataModule
 from src.lightning_model import BatteryLightningModel
 from src.utils import get_loss_weight_lists
+
+
+warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*")
+warnings.filterwarnings("ignore", message=".*IterableDataset.*__len__.*")
+warnings.filterwarnings("ignore", message=".*infer.*batch_size.*")
+warnings.filterwarnings("ignore", message=".*compute.*method.*called before.*update.*")
+warnings.filterwarnings("ignore", message=".*Precision.*not supported.*model summary.*")
+warnings.filterwarnings(
+    "ignore", message=".*ModelCheckpoint.*could not find.*monitored key.*"
+)
+warnings.filterwarnings("ignore", category=UserWarning, module="pytorch_lightning")
+torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 
 @rank_zero_only
@@ -136,6 +149,7 @@ def main(args):
         patience=train_config["training"]["early_stopping"]["patience"],
         mode="min",
         verbose=True,
+        check_on_train_epoch_end=False,
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
@@ -155,6 +169,9 @@ def main(args):
         logger=logger,
         deterministic="warn",
         log_every_n_steps=10,
+        num_sanity_val_steps=0,
+        check_val_every_n_epoch=1,
+        val_check_interval=1.0,
     )
 
     # Train

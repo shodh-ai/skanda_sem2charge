@@ -13,8 +13,7 @@ from pathlib import Path
 from typing import Dict
 import numpy as np
 
-# Import shared feature config
-from utils.feature_config import (
+from .utils import (
     MICROSTRUCTURE_SHORT,
     PERFORMANCE_SHORT,
     get_loss_weight_tensors,
@@ -35,10 +34,7 @@ class BatteryLightningModel(pl.LightningModule):
     - Support for feature-specific analysis
     """
 
-    def __init__(
-        self,
-        config: Dict,
-    ):
+    def __init__(self, config: Dict):
         super().__init__()
         self.save_hyperparameters()
         self.config = config
@@ -96,6 +92,67 @@ class BatteryLightningModel(pl.LightningModule):
         self.test_targets = []
         self.test_metadata = []
 
+    def _safe_compute_r2(self, metric, feature_name):
+        """
+        Safely compute R² metric, returning NaN if insufficient samples.
+        """
+        try:
+            # Check if metric has been updated
+            if hasattr(metric, "sum_squared_error"):
+                if metric.sum_squared_error.numel() == 0:
+                    return float("nan")
+
+            r2 = metric.compute()
+
+            # Check for invalid values
+            if torch.isinf(r2) or torch.isnan(r2):
+                return float("nan")
+
+            return r2
+
+        except (ValueError, RuntimeError, ZeroDivisionError) as e:
+            error_msgs = [
+                "Needs at least two samples",
+                "No samples",
+                "divide by zero",
+                "invalid value",
+                "empty tensor",
+            ]
+            if any(msg in str(e) for msg in error_msgs):
+                return float("nan")
+            else:
+                print(f"⚠️  Unexpected error computing R² for {feature_name}: {e}")
+                raise
+
+    def _safe_compute_metric(self, metric, feature_name, metric_type):
+        """
+        Safely compute any metric (MSE, MAE, MAPE), returning NaN if insufficient samples.
+        """
+        try:
+            value = metric.compute()
+
+            # Check for invalid values
+            if torch.isinf(value) or torch.isnan(value):
+                return float("nan")
+
+            return value
+
+        except (ValueError, RuntimeError, ZeroDivisionError) as e:
+            error_msgs = [
+                "Needs at least",
+                "No samples",
+                "divide by zero",
+                "invalid value",
+                "empty",
+            ]
+            if any(msg in str(e) for msg in error_msgs):
+                return float("nan")
+            else:
+                print(
+                    f"⚠️  Unexpected error computing {metric_type} for {feature_name}: {e}"
+                )
+                raise
+
     def forward(self, image, params):
         """Forward pass through model"""
         return self.model(image, params)
@@ -109,21 +166,12 @@ class BatteryLightningModel(pl.LightningModule):
     ) -> Dict[str, torch.Tensor]:
         """
         Compute weighted multi-task loss with per-feature weighting.
-
-        Args:
-            pred_micro: [B, 4] microstructure predictions
-            target_micro: [B, 4] microstructure targets
-            pred_perf: [B, 5] performance predictions
-            target_perf: [B, 5] performance targets
-
-        Returns:
-            Dictionary with total_loss, micro_loss, perf_loss, and per-feature losses
         """
         # Per-feature MSE: [B, 4] and [B, 5]
         micro_mse_per_feat = self.mse(pred_micro, target_micro)  # [B, 4]
         perf_mse_per_feat = self.mse(pred_perf, target_perf)  # [B, 5]
 
-        # Apply weights and reduce: mean over batch, weighted sum over features
+        # Apply weights and reduce
         micro_weights = self.microstructure_weights.to(pred_micro.device)
         perf_weights = self.performance_weights.to(pred_perf.device)
 
@@ -188,7 +236,7 @@ class BatteryLightningModel(pl.LightningModule):
         )
         self.log("train_perf_loss", losses["perf_loss"], on_epoch=True, sync_dist=True)
 
-        # Log per-feature losses (only on epoch end to reduce clutter)
+        # Log per-feature losses (only on epoch end)
         for key, value in losses.items():
             if key not in ["total_loss", "micro_loss", "perf_loss"]:
                 self.log(f"train_{key}", value, on_epoch=True, sync_dist=True)
@@ -196,29 +244,45 @@ class BatteryLightningModel(pl.LightningModule):
         return losses["total_loss"]
 
     def on_train_epoch_end(self):
-        """Log per-feature R² scores at epoch end"""
+        """Log per-feature R² scores at epoch end with safety checks"""
+
         # Microstructure R²
+        micro_r2_values = []
         for i, name in enumerate(MICROSTRUCTURE_SHORT):
-            r2 = self.train_micro_r2_per_feature[i].compute()
+            r2 = self._safe_compute_r2(
+                self.train_micro_r2_per_feature[i], f"train_micro_{name}"
+            )
             self.log(f"train_micro_r2_{name}", r2, sync_dist=True)
+            if not (isinstance(r2, float) and np.isnan(r2)):
+                micro_r2_values.append(r2)
             self.train_micro_r2_per_feature[i].reset()
 
         # Performance R²
+        perf_r2_values = []
         for i, name in enumerate(PERFORMANCE_SHORT):
-            r2 = self.train_perf_r2_per_feature[i].compute()
+            r2 = self._safe_compute_r2(
+                self.train_perf_r2_per_feature[i], f"train_perf_{name}"
+            )
             self.log(f"train_perf_r2_{name}", r2, sync_dist=True)
+            if not (isinstance(r2, float) and np.isnan(r2)):
+                perf_r2_values.append(r2)
             self.train_perf_r2_per_feature[i].reset()
 
-        # Compute average R² for overall tracking
-        micro_r2_avg = torch.stack(
-            [self.train_micro_r2_per_feature[i].compute() for i in range(4)]
-        ).mean()
-        perf_r2_avg = torch.stack(
-            [self.train_perf_r2_per_feature[i].compute() for i in range(5)]
-        ).mean()
+        # Compute average R²
+        if len(micro_r2_values) > 0:
+            micro_r2_avg = torch.stack(
+                [
+                    torch.tensor(r) if isinstance(r, float) else r
+                    for r in micro_r2_values
+                ]
+            ).mean()
+            self.log("train_micro_r2_avg", micro_r2_avg, sync_dist=True)
 
-        self.log("train_micro_r2_avg", micro_r2_avg, sync_dist=True)
-        self.log("train_perf_r2_avg", perf_r2_avg, sync_dist=True)
+        if len(perf_r2_values) > 0:
+            perf_r2_avg = torch.stack(
+                [torch.tensor(r) if isinstance(r, float) else r for r in perf_r2_values]
+            ).mean()
+            self.log("train_perf_r2_avg", perf_r2_avg, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
         """Validation step with per-feature metrics"""
@@ -255,33 +319,55 @@ class BatteryLightningModel(pl.LightningModule):
         return losses["total_loss"]
 
     def on_validation_epoch_end(self):
-        """Log per-feature R² scores at validation epoch end"""
+        """Log per-feature R² scores at validation epoch end with safety checks"""
+
         # Microstructure R²
+        micro_r2_values = []
         for i, name in enumerate(MICROSTRUCTURE_SHORT):
-            r2 = self.val_micro_r2_per_feature[i].compute()
+            r2 = self._safe_compute_r2(
+                self.val_micro_r2_per_feature[i], f"val_micro_{name}"
+            )
             self.log(
-                f"val_micro_r2_{name}", r2, prog_bar=(i == 2), sync_dist=True
-            )  # Show tau in progress bar
+                f"val_micro_r2_{name}",
+                r2,
+                prog_bar=(i == 2),  # Show tau in progress bar
+                sync_dist=True,
+            )
+            if not (isinstance(r2, float) and np.isnan(r2)):
+                micro_r2_values.append(r2)
             self.val_micro_r2_per_feature[i].reset()
 
         # Performance R²
+        perf_r2_values = []
         for i, name in enumerate(PERFORMANCE_SHORT):
-            r2 = self.val_perf_r2_per_feature[i].compute()
+            r2 = self._safe_compute_r2(
+                self.val_perf_r2_per_feature[i], f"val_perf_{name}"
+            )
             self.log(
-                f"val_perf_r2_{name}", r2, prog_bar=(i == 0), sync_dist=True
-            )  # Show cycle_life in progress bar
+                f"val_perf_r2_{name}",
+                r2,
+                prog_bar=(i == 0),  # Show cycle_life in progress bar
+                sync_dist=True,
+            )
+            if not (isinstance(r2, float) and np.isnan(r2)):
+                perf_r2_values.append(r2)
             self.val_perf_r2_per_feature[i].reset()
 
-        # Average R² for overall tracking
-        micro_r2_avg = torch.stack(
-            [self.val_micro_r2_per_feature[i].compute() for i in range(4)]
-        ).mean()
-        perf_r2_avg = torch.stack(
-            [self.val_perf_r2_per_feature[i].compute() for i in range(5)]
-        ).mean()
+        # Average R²
+        if len(micro_r2_values) > 0:
+            micro_r2_avg = torch.stack(
+                [
+                    torch.tensor(r) if isinstance(r, float) else r
+                    for r in micro_r2_values
+                ]
+            ).mean()
+            self.log("val_micro_r2_avg", micro_r2_avg, sync_dist=True)
 
-        self.log("val_micro_r2_avg", micro_r2_avg, sync_dist=True)
-        self.log("val_perf_r2_avg", perf_r2_avg, prog_bar=True, sync_dist=True)
+        if len(perf_r2_values) > 0:
+            perf_r2_avg = torch.stack(
+                [torch.tensor(r) if isinstance(r, float) else r for r in perf_r2_values]
+            ).mean()
+            self.log("val_perf_r2_avg", perf_r2_avg, prog_bar=True, sync_dist=True)
 
     def test_step(self, batch, batch_idx):
         """Test step with comprehensive per-feature metrics"""
@@ -313,7 +399,7 @@ class BatteryLightningModel(pl.LightningModule):
             self.test_perf_metrics["r2"][i](pred_i, target_i)
             self.test_perf_metrics["mape"][i](pred_i, target_i)
 
-        # Store predictions for detailed analysis
+        # Store predictions
         self.test_predictions.append(
             {
                 "microstructure": pred["microstructure"].detach().cpu(),
@@ -346,61 +432,102 @@ class BatteryLightningModel(pl.LightningModule):
         # ========== MICROSTRUCTURE METRICS ==========
         micro_results = {}
         for i, name in enumerate(MICROSTRUCTURE_SHORT):
-            mse_val = self.test_micro_metrics["mse"][i].compute()
-            mae_val = self.test_micro_metrics["mae"][i].compute()
-            r2_val = self.test_micro_metrics["r2"][i].compute()
-            mape_val = self.test_micro_metrics["mape"][i].compute()
-            rmse_val = torch.sqrt(mse_val)
+            mse_val = self._safe_compute_metric(
+                self.test_micro_metrics["mse"][i], name, "mse"
+            )
+            mae_val = self._safe_compute_metric(
+                self.test_micro_metrics["mae"][i], name, "mae"
+            )
+            r2_val = self._safe_compute_r2(
+                self.test_micro_metrics["r2"][i], f"test_micro_{name}"
+            )
+            mape_val = self._safe_compute_metric(
+                self.test_micro_metrics["mape"][i], name, "mape"
+            )
+
+            # Compute RMSE from MSE
+            if isinstance(mse_val, torch.Tensor) and not torch.isnan(mse_val):
+                rmse_val = torch.sqrt(mse_val)
+            else:
+                rmse_val = float("nan")
 
             micro_results[name] = {
-                "MSE": float(mse_val),
-                "RMSE": float(rmse_val),
-                "MAE": float(mae_val),
-                "R2": float(r2_val),
-                "MAPE": float(mape_val),
+                "MSE": float(mse_val) if isinstance(mse_val, torch.Tensor) else mse_val,
+                "RMSE": (
+                    float(rmse_val) if isinstance(rmse_val, torch.Tensor) else rmse_val
+                ),
+                "MAE": float(mae_val) if isinstance(mae_val, torch.Tensor) else mae_val,
+                "R2": float(r2_val) if isinstance(r2_val, torch.Tensor) else r2_val,
+                "MAPE": (
+                    float(mape_val) if isinstance(mape_val, torch.Tensor) else mape_val
+                ),
             }
 
             # Log individual metrics
-            self.log(f"test_micro_mse_{name}", mse_val)
-            self.log(f"test_micro_rmse_{name}", rmse_val)
-            self.log(f"test_micro_mae_{name}", mae_val)
-            self.log(f"test_micro_r2_{name}", r2_val)
-            self.log(f"test_micro_mape_{name}", mape_val)
+            self.log(f"test_micro_mse_{name}", micro_results[name]["MSE"])
+            self.log(f"test_micro_rmse_{name}", micro_results[name]["RMSE"])
+            self.log(f"test_micro_mae_{name}", micro_results[name]["MAE"])
+            self.log(f"test_micro_r2_{name}", micro_results[name]["R2"])
+            self.log(f"test_micro_mape_{name}", micro_results[name]["MAPE"])
 
         # ========== PERFORMANCE METRICS ==========
         perf_results = {}
         for i, name in enumerate(PERFORMANCE_SHORT):
-            mse_val = self.test_perf_metrics["mse"][i].compute()
-            mae_val = self.test_perf_metrics["mae"][i].compute()
-            r2_val = self.test_perf_metrics["r2"][i].compute()
-            mape_val = self.test_perf_metrics["mape"][i].compute()
-            rmse_val = torch.sqrt(mse_val)
+            mse_val = self._safe_compute_metric(
+                self.test_perf_metrics["mse"][i], name, "mse"
+            )
+            mae_val = self._safe_compute_metric(
+                self.test_perf_metrics["mae"][i], name, "mae"
+            )
+            r2_val = self._safe_compute_r2(
+                self.test_perf_metrics["r2"][i], f"test_perf_{name}"
+            )
+            mape_val = self._safe_compute_metric(
+                self.test_perf_metrics["mape"][i], name, "mape"
+            )
+
+            # Compute RMSE from MSE
+            if isinstance(mse_val, torch.Tensor) and not torch.isnan(mse_val):
+                rmse_val = torch.sqrt(mse_val)
+            else:
+                rmse_val = float("nan")
 
             perf_results[name] = {
-                "MSE": float(mse_val),
-                "RMSE": float(rmse_val),
-                "MAE": float(mae_val),
-                "R2": float(r2_val),
-                "MAPE": float(mape_val),
+                "MSE": float(mse_val) if isinstance(mse_val, torch.Tensor) else mse_val,
+                "RMSE": (
+                    float(rmse_val) if isinstance(rmse_val, torch.Tensor) else rmse_val
+                ),
+                "MAE": float(mae_val) if isinstance(mae_val, torch.Tensor) else mae_val,
+                "R2": float(r2_val) if isinstance(r2_val, torch.Tensor) else r2_val,
+                "MAPE": (
+                    float(mape_val) if isinstance(mape_val, torch.Tensor) else mape_val
+                ),
             }
 
             # Log individual metrics
-            self.log(f"test_perf_mse_{name}", mse_val)
-            self.log(f"test_perf_rmse_{name}", rmse_val)
-            self.log(f"test_perf_mae_{name}", mae_val)
-            self.log(f"test_perf_r2_{name}", r2_val)
-            self.log(f"test_perf_mape_{name}", mape_val)
+            self.log(f"test_perf_mse_{name}", perf_results[name]["MSE"])
+            self.log(f"test_perf_rmse_{name}", perf_results[name]["RMSE"])
+            self.log(f"test_perf_mae_{name}", perf_results[name]["MAE"])
+            self.log(f"test_perf_r2_{name}", perf_results[name]["R2"])
+            self.log(f"test_perf_mape_{name}", perf_results[name]["MAPE"])
 
         # ========== AVERAGE METRICS ==========
-        avg_micro_r2 = np.mean(
-            [micro_results[name]["R2"] for name in MICROSTRUCTURE_SHORT]
+        valid_micro_r2 = [
+            v["R2"] for v in micro_results.values() if not np.isnan(v["R2"])
+        ]
+        avg_micro_r2 = (
+            np.mean(valid_micro_r2) if len(valid_micro_r2) > 0 else float("nan")
         )
-        avg_perf_r2 = np.mean([perf_results[name]["R2"] for name in PERFORMANCE_SHORT])
+
+        valid_perf_r2 = [
+            v["R2"] for v in perf_results.values() if not np.isnan(v["R2"])
+        ]
+        avg_perf_r2 = np.mean(valid_perf_r2) if len(valid_perf_r2) > 0 else float("nan")
 
         self.log("test_micro_r2_avg", avg_micro_r2)
         self.log("test_perf_r2_avg", avg_perf_r2)
 
-        # ========== CREATE COMPREHENSIVE REPORT ==========
+        # ========== CREATE REPORT ==========
         report = {
             "model_info": {
                 "total_parameters": sum(p.numel() for p in self.parameters()),
@@ -422,13 +549,8 @@ class BatteryLightningModel(pl.LightningModule):
             },
         }
 
-        # Store report
         self.test_report = report
-
-        # Print formatted report
         self._print_detailed_test_report(report)
-
-        # Save detailed predictions
         self._save_predictions()
 
     def _print_detailed_test_report(self, report):
@@ -478,25 +600,28 @@ class BatteryLightningModel(pl.LightningModule):
 
         print("\n" + "=" * 100)
 
-        # Highlight best and worst performing features
+        # Highlights
         print("\n🎯 FEATURE PERFORMANCE HIGHLIGHTS:")
 
         all_r2s = {
             **{
                 f"micro_{k}": v["R2"]
                 for k, v in report["microstructure_metrics"]["per_feature"].items()
+                if not np.isnan(v["R2"])
             },
             **{
                 f"perf_{k}": v["R2"]
                 for k, v in report["performance_metrics"]["per_feature"].items()
+                if not np.isnan(v["R2"])
             },
         }
 
-        best_feature = max(all_r2s.items(), key=lambda x: x[1])
-        worst_feature = min(all_r2s.items(), key=lambda x: x[1])
+        if len(all_r2s) > 0:
+            best_feature = max(all_r2s.items(), key=lambda x: x[1])
+            worst_feature = min(all_r2s.items(), key=lambda x: x[1])
 
-        print(f"  🏆 Best:  {best_feature[0]:<25} R² = {best_feature[1]:.4f}")
-        print(f"  ⚠️  Worst: {worst_feature[0]:<25} R² = {worst_feature[1]:.4f}")
+            print(f"  🏆 Best:  {best_feature[0]:<25} R² = {best_feature[1]:.4f}")
+            print(f"  ⚠️  Worst: {worst_feature[0]:<25} R² = {worst_feature[1]:.4f}")
 
         print("=" * 100 + "\n")
 

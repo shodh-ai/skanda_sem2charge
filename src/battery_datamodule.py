@@ -7,7 +7,7 @@ import numpy as np
 import json
 from typing import Optional
 
-from utils import (
+from .utils import (
     INPUT_FEATURES,
     MICROSTRUCTURE_FEATURES,
     PERFORMANCE_FEATURES,
