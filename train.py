@@ -15,21 +15,31 @@ from datetime import datetime
 
 from src.battery_datamodule import BatteryDataModule
 from src.lightning_model import BatteryLightningModel
+from src.utils import get_loss_weight_lists
 
 
 @rank_zero_only
 def print_config(args, train_config, paths_config, total_params):
+    perf_weights, micro_weights = get_loss_weight_lists()
+
     print("=" * 80)
     print("🔋 Training Battery Prediction Model")
     print("=" * 80)
     print(f"Experiment: {args.experiment_name}")
     print(f"Epochs: {train_config['training']['epochs']}")
     print(f"Batch size (per GPU): {train_config['training']['batch_size']}")
-    print(
-        f"Total Effective Batch size: {train_config['training']['batch_size'] * train_config['training'].get('devices', 1) if train_config['training'].get('devices') != -1 else 'Dynamic'}"
-    )
+    devices = train_config["training"].get("devices", 1)
+    if devices == -1:
+        print(f"Total Effective Batch size: Dynamic (all GPUs)")
+    else:
+        print(
+            f"Total Effective Batch size: {train_config['training']['batch_size'] * devices}"
+        )
     print(f"Data dir: {paths_config['data']['output']['optimized_dir']}")
     print(f"Total parameters: {total_params:,}")
+    print(f"\n📊 Loss Weights (from utils/feature_config.py):")
+    print(f"  Performance: {perf_weights}")
+    print(f"  Microstructure: {micro_weights}")
     print("=" * 80)
 
 
@@ -118,6 +128,7 @@ def main(args):
         monitor="val_loss",
         mode="min",
         save_top_k=3,
+        save_last=train_config["training"]["checkpoint"].get("save_last", True),
     )
 
     early_stopping = EarlyStopping(
@@ -139,7 +150,7 @@ def main(args):
         devices=train_config["training"]["devices"],
         precision=train_config["training"]["precision"],
         gradient_clip_val=train_config["training"]["gradient_clip_val"],
-        strategy="ddp",
+        strategy="ddp" if train_config["training"]["devices"] != 1 else "auto",
         callbacks=[checkpoint_callback, early_stopping, lr_monitor],
         logger=logger,
         deterministic="warn",

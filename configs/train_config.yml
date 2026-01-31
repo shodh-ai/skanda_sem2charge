@@ -5,14 +5,15 @@ training:
   num_workers: 24
   accelerator: "gpu"
   devices: -1
-  precision: 16
+  precision: "16-mixed"
   gradient_clip_val: 1.0
 
   # Early stopping
   early_stopping:
     monitor: "val_loss"
-    patience: 15
+    patience: 20
     mode: "min"
+    save_last: true
 
   # Model checkpointing
   checkpoint:
@@ -23,17 +24,13 @@ training:
 # Optimizer
 optimizer:
   name: "adamw"
-  lr: 0.001
-  weight_decay: 0.0001
+  lr: 0.0003
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
 
 # Scheduler
 scheduler:
   name: "reduce_on_plateau"
-  patience: 10
+  patience: 15
   factor: 0.5
-  min_lr: 1.0e-6
-
-# Loss weights
-loss_weights:
-  microstructure: 1.0
-  performance: 1.0
+  min_lr: 1.0e-7
