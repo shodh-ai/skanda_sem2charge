@@ -52,106 +52,11 @@ class BatteryLightningModel(pl.LightningModule):
 
         # Base loss functions
         self.mse = nn.MSELoss(reduction="none")
-        self.mae = nn.L1Loss(reduction="none")
 
-        # ========== PER-FEATURE METRICS ==========
-
-        # Training metrics - per feature R²
-        self.train_micro_r2_per_feature = nn.ModuleList([R2Score() for _ in range(4)])
-        self.train_perf_r2_per_feature = nn.ModuleList([R2Score() for _ in range(5)])
-
-        # Validation metrics - per feature
-        self.val_micro_r2_per_feature = nn.ModuleList([R2Score() for _ in range(4)])
-        self.val_perf_r2_per_feature = nn.ModuleList([R2Score() for _ in range(5)])
-
-        # Test metrics - comprehensive per feature
-        self.test_micro_metrics = nn.ModuleDict(
-            {
-                "mse": nn.ModuleList([MeanSquaredError() for _ in range(4)]),
-                "mae": nn.ModuleList([MeanAbsoluteError() for _ in range(4)]),
-                "r2": nn.ModuleList([R2Score() for _ in range(4)]),
-                "mape": nn.ModuleList(
-                    [MeanAbsolutePercentageError() for _ in range(4)]
-                ),
-            }
-        )
-
-        self.test_perf_metrics = nn.ModuleDict(
-            {
-                "mse": nn.ModuleList([MeanSquaredError() for _ in range(5)]),
-                "mae": nn.ModuleList([MeanAbsoluteError() for _ in range(5)]),
-                "r2": nn.ModuleList([R2Score() for _ in range(5)]),
-                "mape": nn.ModuleList(
-                    [MeanAbsolutePercentageError() for _ in range(5)]
-                ),
-            }
-        )
-
-        # Store test predictions for detailed analysis
-        self.test_predictions = []
-        self.test_targets = []
-        self.test_metadata = []
-
-    def _safe_compute_r2(self, metric, feature_name):
-        """
-        Safely compute R² metric, returning NaN if insufficient samples.
-        """
-        try:
-            # Check if metric has been updated
-            if hasattr(metric, "sum_squared_error"):
-                if metric.sum_squared_error.numel() == 0:
-                    return float("nan")
-
-            r2 = metric.compute()
-
-            # Check for invalid values
-            if torch.isinf(r2) or torch.isnan(r2):
-                return float("nan")
-
-            return r2
-
-        except (ValueError, RuntimeError, ZeroDivisionError) as e:
-            error_msgs = [
-                "Needs at least two samples",
-                "No samples",
-                "divide by zero",
-                "invalid value",
-                "empty tensor",
-            ]
-            if any(msg in str(e) for msg in error_msgs):
-                return float("nan")
-            else:
-                print(f"⚠️  Unexpected error computing R² for {feature_name}: {e}")
-                raise
-
-    def _safe_compute_metric(self, metric, feature_name, metric_type):
-        """
-        Safely compute any metric (MSE, MAE, MAPE), returning NaN if insufficient samples.
-        """
-        try:
-            value = metric.compute()
-
-            # Check for invalid values
-            if torch.isinf(value) or torch.isnan(value):
-                return float("nan")
-
-            return value
-
-        except (ValueError, RuntimeError, ZeroDivisionError) as e:
-            error_msgs = [
-                "Needs at least",
-                "No samples",
-                "divide by zero",
-                "invalid value",
-                "empty",
-            ]
-            if any(msg in str(e) for msg in error_msgs):
-                return float("nan")
-            else:
-                print(
-                    f"⚠️  Unexpected error computing {metric_type} for {feature_name}: {e}"
-                )
-                raise
+        self.test_pred_micro = []
+        self.test_pred_perf = []
+        self.test_target_micro = []
+        self.test_target_perf = []
 
     def forward(self, image, params):
         """Forward pass through model"""
@@ -182,350 +87,192 @@ class BatteryLightningModel(pl.LightningModule):
         # Total loss
         total_loss = micro_loss + perf_loss
 
-        # Store individual feature losses for logging
-        micro_losses_dict = {
-            f"micro_{MICROSTRUCTURE_SHORT[i]}_loss": micro_mse_per_feat[:, i].mean()
-            for i in range(4)
-        }
-        perf_losses_dict = {
-            f"perf_{PERFORMANCE_SHORT[i]}_loss": perf_mse_per_feat[:, i].mean()
-            for i in range(5)
-        }
-
         return {
             "total_loss": total_loss,
             "micro_loss": micro_loss,
             "perf_loss": perf_loss,
-            **micro_losses_dict,
-            **perf_losses_dict,
         }
 
     def training_step(self, batch, batch_idx):
         """Training step with per-feature metric updates"""
         pred = self(batch["image"], batch["input_params"])
+        pred_micro = pred["microstructure"]
+        pred_perf = pred["performance"]
         target_micro = batch["microstructure_outputs"]
         target_perf = batch["performance_outputs"]
 
         # Compute losses
         losses = self.compute_weighted_loss(
-            pred["microstructure"], target_micro, pred["performance"], target_perf
+            pred_micro, target_micro, pred_perf, target_perf
         )
+        total_loss = losses["total_loss"]
+        micro_loss = losses["micro_loss"]
+        perf_loss = losses["perf_loss"]
 
-        # Update per-feature R² metrics
-        for i in range(4):
-            self.train_micro_r2_per_feature[i](
-                pred["microstructure"][:, i], target_micro[:, i]
-            )
-
-        for i in range(5):
-            self.train_perf_r2_per_feature[i](
-                pred["performance"][:, i], target_perf[:, i]
-            )
-
-        # Log main losses
+        # Logging in training step
         self.log(
             "train_loss",
-            losses["total_loss"],
+            total_loss,
             prog_bar=True,
             on_step=True,
             on_epoch=True,
             sync_dist=True,
         )
         self.log(
-            "train_micro_loss", losses["micro_loss"], on_epoch=True, sync_dist=True
+            "train_micro_loss",
+            micro_loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
         )
-        self.log("train_perf_loss", losses["perf_loss"], on_epoch=True, sync_dist=True)
+        self.log(
+            "train_perf_loss",
+            perf_loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
 
-        # Log per-feature losses (only on epoch end)
-        for key, value in losses.items():
-            if key not in ["total_loss", "micro_loss", "perf_loss"]:
-                self.log(f"train_{key}", value, on_epoch=True, sync_dist=True)
-
-        return losses["total_loss"]
-
-    def on_train_epoch_end(self):
-        """Log per-feature R² scores at epoch end with safety checks"""
-
-        # Microstructure R²
-        micro_r2_values = []
-        for i, name in enumerate(MICROSTRUCTURE_SHORT):
-            r2 = self._safe_compute_r2(
-                self.train_micro_r2_per_feature[i], f"train_micro_{name}"
-            )
-            self.log(f"train_micro_r2_{name}", r2, sync_dist=True)
-            if not (isinstance(r2, float) and np.isnan(r2)):
-                micro_r2_values.append(r2)
-            self.train_micro_r2_per_feature[i].reset()
-
-        # Performance R²
-        perf_r2_values = []
-        for i, name in enumerate(PERFORMANCE_SHORT):
-            r2 = self._safe_compute_r2(
-                self.train_perf_r2_per_feature[i], f"train_perf_{name}"
-            )
-            self.log(f"train_perf_r2_{name}", r2, sync_dist=True)
-            if not (isinstance(r2, float) and np.isnan(r2)):
-                perf_r2_values.append(r2)
-            self.train_perf_r2_per_feature[i].reset()
-
-        # Compute average R²
-        if len(micro_r2_values) > 0:
-            micro_r2_avg = torch.stack(
-                [
-                    torch.tensor(r) if isinstance(r, float) else r
-                    for r in micro_r2_values
-                ]
-            ).mean()
-            self.log("train_micro_r2_avg", micro_r2_avg, sync_dist=True)
-
-        if len(perf_r2_values) > 0:
-            perf_r2_avg = torch.stack(
-                [torch.tensor(r) if isinstance(r, float) else r for r in perf_r2_values]
-            ).mean()
-            self.log("train_perf_r2_avg", perf_r2_avg, sync_dist=True)
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step with per-feature metrics"""
+        """Validation step - loss + R² metrics"""
         pred = self(batch["image"], batch["input_params"])
+        pred_micro = pred["microstructure"]
+        pred_perf = pred["performance"]
         target_micro = batch["microstructure_outputs"]
         target_perf = batch["performance_outputs"]
 
         # Compute losses
         losses = self.compute_weighted_loss(
-            pred["microstructure"], target_micro, pred["performance"], target_perf
+            pred_micro, target_micro, pred_perf, target_perf
+        )
+        total_loss = losses["total_loss"]
+        micro_loss = losses["micro_loss"]
+        perf_loss = losses["perf_loss"]
+
+        # Logging in validation step
+        self.log(
+            "val_loss",
+            total_loss,
+            prog_bar=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val_micro_loss",
+            micro_loss,
+            prog_bar=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val_perf_loss",
+            perf_loss,
+            prog_bar=True,
+            on_epoch=True,
+            sync_dist=True,
         )
 
-        # Update per-feature R² metrics
-        for i in range(4):
-            self.val_micro_r2_per_feature[i](
-                pred["microstructure"][:, i], target_micro[:, i]
-            )
-
-        for i in range(5):
-            self.val_perf_r2_per_feature[i](
-                pred["performance"][:, i], target_perf[:, i]
-            )
-
-        # Log main losses
-        self.log("val_loss", losses["total_loss"], prog_bar=True, sync_dist=True)
-        self.log("val_micro_loss", losses["micro_loss"], sync_dist=True)
-        self.log("val_perf_loss", losses["perf_loss"], sync_dist=True)
-
-        # Log per-feature losses
-        for key, value in losses.items():
-            if key not in ["total_loss", "micro_loss", "perf_loss"]:
-                self.log(f"val_{key}", value, sync_dist=True)
-
-        return losses["total_loss"]
-
-    def on_validation_epoch_end(self):
-        """Log per-feature R² scores at validation epoch end with safety checks"""
-
-        # Microstructure R²
-        micro_r2_values = []
-        for i, name in enumerate(MICROSTRUCTURE_SHORT):
-            r2 = self._safe_compute_r2(
-                self.val_micro_r2_per_feature[i], f"val_micro_{name}"
-            )
-            self.log(
-                f"val_micro_r2_{name}",
-                r2,
-                prog_bar=(i == 2),  # Show tau in progress bar
-                sync_dist=True,
-            )
-            if not (isinstance(r2, float) and np.isnan(r2)):
-                micro_r2_values.append(r2)
-            self.val_micro_r2_per_feature[i].reset()
-
-        # Performance R²
-        perf_r2_values = []
-        for i, name in enumerate(PERFORMANCE_SHORT):
-            r2 = self._safe_compute_r2(
-                self.val_perf_r2_per_feature[i], f"val_perf_{name}"
-            )
-            self.log(
-                f"val_perf_r2_{name}",
-                r2,
-                prog_bar=(i == 0),  # Show cycle_life in progress bar
-                sync_dist=True,
-            )
-            if not (isinstance(r2, float) and np.isnan(r2)):
-                perf_r2_values.append(r2)
-            self.val_perf_r2_per_feature[i].reset()
-
-        # Average R²
-        if len(micro_r2_values) > 0:
-            micro_r2_avg = torch.stack(
-                [
-                    torch.tensor(r) if isinstance(r, float) else r
-                    for r in micro_r2_values
-                ]
-            ).mean()
-            self.log("val_micro_r2_avg", micro_r2_avg, sync_dist=True)
-
-        if len(perf_r2_values) > 0:
-            perf_r2_avg = torch.stack(
-                [torch.tensor(r) if isinstance(r, float) else r for r in perf_r2_values]
-            ).mean()
-            self.log("val_perf_r2_avg", perf_r2_avg, prog_bar=True, sync_dist=True)
+        return total_loss
 
     def test_step(self, batch, batch_idx):
-        """Test step with comprehensive per-feature metrics"""
+        """Test step - accumulate predictions and targets"""
         pred = self(batch["image"], batch["input_params"])
+        pred_micro = pred["microstructure"]
+        pred_perf = pred["performance"]
         target_micro = batch["microstructure_outputs"]
         target_perf = batch["performance_outputs"]
 
         # Compute losses
         losses = self.compute_weighted_loss(
-            pred["microstructure"], target_micro, pred["performance"], target_perf
+            pred_micro, target_micro, pred_perf, target_perf
         )
+        total_loss = losses["total_loss"]
+        micro_loss = losses["micro_loss"]
+        perf_loss = losses["perf_loss"]
 
-        # Update ALL per-feature metrics
-        for i in range(4):
-            pred_i = pred["microstructure"][:, i]
-            target_i = target_micro[:, i]
+        # Store predictions and targets (detach and move to CPU to save memory)
+        self.test_pred_micro.append(pred_micro.detach().cpu())
+        self.test_pred_perf.append(pred_perf.detach().cpu())
+        self.test_target_micro.append(target_micro.detach().cpu())
+        self.test_target_perf.append(target_perf.detach().cpu())
 
-            self.test_micro_metrics["mse"][i](pred_i, target_i)
-            self.test_micro_metrics["mae"][i](pred_i, target_i)
-            self.test_micro_metrics["r2"][i](pred_i, target_i)
-            self.test_micro_metrics["mape"][i](pred_i, target_i)
+        # Log only losses to tensorboard
+        self.log("test_loss", total_loss, sync_dist=True)
+        self.log("test_micro_loss", micro_loss, sync_dist=True)
+        self.log("test_perf_loss", perf_loss, sync_dist=True)
 
-        for i in range(5):
-            pred_i = pred["performance"][:, i]
-            target_i = target_perf[:, i]
-
-            self.test_perf_metrics["mse"][i](pred_i, target_i)
-            self.test_perf_metrics["mae"][i](pred_i, target_i)
-            self.test_perf_metrics["r2"][i](pred_i, target_i)
-            self.test_perf_metrics["mape"][i](pred_i, target_i)
-
-        # Store predictions
-        self.test_predictions.append(
-            {
-                "microstructure": pred["microstructure"].detach().cpu(),
-                "performance": pred["performance"].detach().cpu(),
-            }
-        )
-        self.test_targets.append(
-            {
-                "microstructure": target_micro.detach().cpu(),
-                "performance": target_perf.detach().cpu(),
-            }
-        )
-        self.test_metadata.append(
-            {
-                "sample_ids": batch.get("sample_ids", []),
-                "param_ids": batch.get("param_ids", []),
-            }
-        )
-
-        # Log basic losses
-        self.log("test_loss", losses["total_loss"])
-        self.log("test_micro_loss", losses["micro_loss"])
-        self.log("test_perf_loss", losses["perf_loss"])
-
-        return losses["total_loss"]
+        return total_loss
 
     def on_test_epoch_end(self):
-        """Compute comprehensive per-feature test metrics and create report"""
+        """Compute comprehensive metrics from stored predictions"""
 
-        # ========== MICROSTRUCTURE METRICS ==========
+        # Concatenate all batches
+        pred_micro = torch.cat(self.test_pred_micro, dim=0)  # [N, 4]
+        pred_perf = torch.cat(self.test_pred_perf, dim=0)  # [N, 5]
+        target_micro = torch.cat(self.test_target_micro, dim=0)  # [N, 4]
+        target_perf = torch.cat(self.test_target_perf, dim=0)  # [N, 5]
+
+        # ========== COMPUTE MICROSTRUCTURE METRICS ==========
         micro_results = {}
         for i, name in enumerate(MICROSTRUCTURE_SHORT):
-            mse_val = self._safe_compute_metric(
-                self.test_micro_metrics["mse"][i], name, "mse"
-            )
-            mae_val = self._safe_compute_metric(
-                self.test_micro_metrics["mae"][i], name, "mae"
-            )
-            r2_val = self._safe_compute_r2(
-                self.test_micro_metrics["r2"][i], f"test_micro_{name}"
-            )
-            mape_val = self._safe_compute_metric(
-                self.test_micro_metrics["mape"][i], name, "mape"
-            )
+            pred_i = pred_micro[:, i]
+            target_i = target_micro[:, i]
 
-            # Compute RMSE from MSE
-            if isinstance(mse_val, torch.Tensor) and not torch.isnan(mse_val):
-                rmse_val = torch.sqrt(mse_val)
-            else:
-                rmse_val = float("nan")
+            # Instantiate metrics (no state, one-time use)
+            mse_metric = MeanSquaredError()
+            mae_metric = MeanAbsoluteError()
+            r2_metric = R2Score()
+            mape_metric = MeanAbsolutePercentageError()
+
+            # Compute on full dataset
+            mse = mse_metric(pred_i, target_i).item()
+            mae = mae_metric(pred_i, target_i).item()
+            r2 = r2_metric(pred_i, target_i).item()
+            mape = mape_metric(pred_i, target_i).item()
+            rmse = torch.sqrt(torch.tensor(mse)).item()
 
             micro_results[name] = {
-                "MSE": float(mse_val) if isinstance(mse_val, torch.Tensor) else mse_val,
-                "RMSE": (
-                    float(rmse_val) if isinstance(rmse_val, torch.Tensor) else rmse_val
-                ),
-                "MAE": float(mae_val) if isinstance(mae_val, torch.Tensor) else mae_val,
-                "R2": float(r2_val) if isinstance(r2_val, torch.Tensor) else r2_val,
-                "MAPE": (
-                    float(mape_val) if isinstance(mape_val, torch.Tensor) else mape_val
-                ),
+                "MSE": mse,
+                "RMSE": rmse,
+                "MAE": mae,
+                "R2": r2,
+                "MAPE": mape,
             }
 
-            # Log individual metrics
-            self.log(f"test_micro_mse_{name}", micro_results[name]["MSE"])
-            self.log(f"test_micro_rmse_{name}", micro_results[name]["RMSE"])
-            self.log(f"test_micro_mae_{name}", micro_results[name]["MAE"])
-            self.log(f"test_micro_r2_{name}", micro_results[name]["R2"])
-            self.log(f"test_micro_mape_{name}", micro_results[name]["MAPE"])
-
-        # ========== PERFORMANCE METRICS ==========
+        # ========== COMPUTE PERFORMANCE METRICS ==========
         perf_results = {}
         for i, name in enumerate(PERFORMANCE_SHORT):
-            mse_val = self._safe_compute_metric(
-                self.test_perf_metrics["mse"][i], name, "mse"
-            )
-            mae_val = self._safe_compute_metric(
-                self.test_perf_metrics["mae"][i], name, "mae"
-            )
-            r2_val = self._safe_compute_r2(
-                self.test_perf_metrics["r2"][i], f"test_perf_{name}"
-            )
-            mape_val = self._safe_compute_metric(
-                self.test_perf_metrics["mape"][i], name, "mape"
-            )
+            pred_i = pred_perf[:, i]
+            target_i = target_perf[:, i]
 
-            # Compute RMSE from MSE
-            if isinstance(mse_val, torch.Tensor) and not torch.isnan(mse_val):
-                rmse_val = torch.sqrt(mse_val)
-            else:
-                rmse_val = float("nan")
+            # Instantiate metrics (no state, one-time use)
+            mse_metric = MeanSquaredError()
+            mae_metric = MeanAbsoluteError()
+            r2_metric = R2Score()
+            mape_metric = MeanAbsolutePercentageError()
+
+            # Compute on full dataset
+            mse = mse_metric(pred_i, target_i).item()
+            mae = mae_metric(pred_i, target_i).item()
+            r2 = r2_metric(pred_i, target_i).item()
+            mape = mape_metric(pred_i, target_i).item()
+            rmse = torch.sqrt(torch.tensor(mse)).item()
 
             perf_results[name] = {
-                "MSE": float(mse_val) if isinstance(mse_val, torch.Tensor) else mse_val,
-                "RMSE": (
-                    float(rmse_val) if isinstance(rmse_val, torch.Tensor) else rmse_val
-                ),
-                "MAE": float(mae_val) if isinstance(mae_val, torch.Tensor) else mae_val,
-                "R2": float(r2_val) if isinstance(r2_val, torch.Tensor) else r2_val,
-                "MAPE": (
-                    float(mape_val) if isinstance(mape_val, torch.Tensor) else mape_val
-                ),
+                "MSE": mse,
+                "RMSE": rmse,
+                "MAE": mae,
+                "R2": r2,
+                "MAPE": mape,
             }
 
-            # Log individual metrics
-            self.log(f"test_perf_mse_{name}", perf_results[name]["MSE"])
-            self.log(f"test_perf_rmse_{name}", perf_results[name]["RMSE"])
-            self.log(f"test_perf_mae_{name}", perf_results[name]["MAE"])
-            self.log(f"test_perf_r2_{name}", perf_results[name]["R2"])
-            self.log(f"test_perf_mape_{name}", perf_results[name]["MAPE"])
-
-        # ========== AVERAGE METRICS ==========
-        valid_micro_r2 = [
-            v["R2"] for v in micro_results.values() if not np.isnan(v["R2"])
-        ]
-        avg_micro_r2 = (
-            np.mean(valid_micro_r2) if len(valid_micro_r2) > 0 else float("nan")
-        )
-
-        valid_perf_r2 = [
-            v["R2"] for v in perf_results.values() if not np.isnan(v["R2"])
-        ]
-        avg_perf_r2 = np.mean(valid_perf_r2) if len(valid_perf_r2) > 0 else float("nan")
-
-        self.log("test_micro_r2_avg", avg_micro_r2)
-        self.log("test_perf_r2_avg", avg_perf_r2)
+        # ========== AVERAGE R² ==========
+        avg_micro_r2 = np.mean([v["R2"] for v in micro_results.values()])
+        avg_perf_r2 = np.mean([v["R2"] for v in perf_results.values()])
 
         # ========== CREATE REPORT ==========
         report = {
@@ -549,9 +296,67 @@ class BatteryLightningModel(pl.LightningModule):
             },
         }
 
-        self.test_report = report
+        # Print to console (not tensorboard)
         self._print_detailed_test_report(report)
-        self._save_predictions()
+
+        # Save predictions and targets
+        self._save_predictions(pred_micro, pred_perf, target_micro, target_perf, report)
+
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler"""
+        opt_cfg = self.config["optimizer"]
+
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=opt_cfg["lr"],
+            weight_decay=opt_cfg["weight_decay"],
+            betas=opt_cfg.get("betas", (0.9, 0.999)),
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=self.config["scheduler"]["factor"],
+            patience=self.config["scheduler"]["patience"],
+            min_lr=self.config["scheduler"]["min_lr"],
+            verbose=True,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
+    def _save_predictions(
+        self, pred_micro, pred_perf, target_micro, target_perf, report
+    ):
+        """Save predictions, targets, and report to experiment directory"""
+        # Save to logger's directory (experiments/{name}/version_X/test_results/)
+        save_dir = Path(self.logger.log_dir) / "test_results"
+        save_dir.mkdir(exist_ok=True, parents=True)
+
+        # Save arrays
+        np.save(save_dir / "predictions_microstructure.npy", pred_micro.numpy())
+        np.save(save_dir / "predictions_performance.npy", pred_perf.numpy())
+        np.save(save_dir / "targets_microstructure.npy", target_micro.numpy())
+        np.save(save_dir / "targets_performance.npy", target_perf.numpy())
+
+        # Save report with metadata
+        report["metadata"] = {
+            "experiment_name": Path(self.logger.log_dir).parent.name,
+            "version": self.logger.version,
+            "log_dir": str(self.logger.log_dir),
+        }
+
+        with open(save_dir / "test_report.json", "w") as f:
+            json.dump(report, f, indent=2)
+
+        print(f"\n💾 Test results saved to: {save_dir}")
 
     def _print_detailed_test_report(self, report):
         """Print beautifully formatted test report to console"""
@@ -624,59 +429,3 @@ class BatteryLightningModel(pl.LightningModule):
             print(f"  ⚠️  Worst: {worst_feature[0]:<25} R² = {worst_feature[1]:.4f}")
 
         print("=" * 100 + "\n")
-
-    def _save_predictions(self):
-        """Save detailed predictions to file"""
-        if len(self.test_predictions) == 0:
-            return
-
-        save_dir = Path(self.logger.log_dir) / "test_results"
-        save_dir.mkdir(exist_ok=True, parents=True)
-
-        # Concatenate all predictions
-        all_pred_micro = torch.cat([p["microstructure"] for p in self.test_predictions])
-        all_pred_perf = torch.cat([p["performance"] for p in self.test_predictions])
-        all_target_micro = torch.cat([t["microstructure"] for t in self.test_targets])
-        all_target_perf = torch.cat([t["performance"] for t in self.test_targets])
-
-        # Save as numpy arrays
-        np.save(save_dir / "predictions_microstructure.npy", all_pred_micro.numpy())
-        np.save(save_dir / "predictions_performance.npy", all_pred_perf.numpy())
-        np.save(save_dir / "targets_microstructure.npy", all_target_micro.numpy())
-        np.save(save_dir / "targets_performance.npy", all_target_perf.numpy())
-
-        # Save report as JSON
-        with open(save_dir / "test_report.json", "w") as f:
-            json.dump(self.test_report, f, indent=2)
-
-        print(f"💾 Test results saved to: {save_dir}")
-
-    def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler"""
-        opt_cfg = self.config["optimizer"]
-
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg["weight_decay"],
-            betas=opt_cfg.get("betas", (0.9, 0.999)),
-        )
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=self.config["scheduler"]["factor"],
-            patience=self.config["scheduler"]["patience"],
-            min_lr=self.config["scheduler"]["min_lr"],
-            verbose=True,
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }

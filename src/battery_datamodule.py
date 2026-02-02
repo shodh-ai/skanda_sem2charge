@@ -11,7 +11,6 @@ from .utils import (
     INPUT_FEATURES,
     MICROSTRUCTURE_FEATURES,
     PERFORMANCE_FEATURES,
-    get_loss_weight_tensors,
 )
 
 
@@ -80,10 +79,6 @@ class BatteryDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
 
-        self.performance_weights, self.microstructure_weights = (
-            get_loss_weight_tensors()
-        )
-
         # Datasets
         self.train_dataset = None
         self.val_dataset = None
@@ -105,23 +100,20 @@ class BatteryDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         """Setup streaming datasets"""
-        if stage == "fit" or stage is None:
-            self.train_dataset = StreamingDataset(
-                input_dir=str(self.data_dir / "train"),
-                shuffle=True,
-                drop_last=True,
-            )
-            self.val_dataset = StreamingDataset(
-                input_dir=str(self.data_dir / "val"), shuffle=False
-            )
-            print(f"📊 Train samples: {len(self.train_dataset):,}")
-            print(f"📊 Val samples:   {len(self.val_dataset):,}")
-
-        if stage == "test" or stage is None:
-            self.test_dataset = StreamingDataset(
-                input_dir=str(self.data_dir / "test"), shuffle=False
-            )
-            print(f"📊 Test samples:  {len(self.test_dataset):,}")
+        self.train_dataset = StreamingDataset(
+            input_dir=str(self.data_dir / "train"),
+            shuffle=True,
+            drop_last=True,
+        )
+        self.val_dataset = StreamingDataset(
+            input_dir=str(self.data_dir / "val"), shuffle=False
+        )
+        self.test_dataset = StreamingDataset(
+            input_dir=str(self.data_dir / "test"), shuffle=False
+        )
+        print(f"📊 Train samples: {len(self.train_dataset):,}")
+        print(f"📊 Val samples:   {len(self.val_dataset):,}")
+        print(f"📊 Test samples:  {len(self.test_dataset):,}")
 
     def train_dataloader(self):
         return DataLoader(

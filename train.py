@@ -10,8 +10,6 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities import rank_zero_only
-import json
-from datetime import datetime
 import warnings
 
 from src.battery_datamodule import BatteryDataModule
@@ -19,93 +17,48 @@ from src.lightning_model import BatteryLightningModel
 from src.utils import get_loss_weight_lists
 
 
-warnings.filterwarnings("ignore", message=".*isinstance.*LeafSpec.*")
-warnings.filterwarnings("ignore", message=".*IterableDataset.*__len__.*")
-warnings.filterwarnings("ignore", message=".*infer.*batch_size.*")
-warnings.filterwarnings("ignore", message=".*compute.*method.*called before.*update.*")
-warnings.filterwarnings("ignore", message=".*Precision.*not supported.*model summary.*")
-warnings.filterwarnings(
-    "ignore", message=".*ModelCheckpoint.*could not find.*monitored key.*"
-)
+# Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pytorch_lightning")
 torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 
 @rank_zero_only
-def print_config(args, train_config, paths_config, total_params):
+def print_training_info(args, train_config, paths_config, total_params):
+    """Print training configuration"""
     perf_weights, micro_weights = get_loss_weight_lists()
-
-    print("=" * 80)
-    print("🔋 Training Battery Prediction Model")
-    print("=" * 80)
-    print(f"Experiment: {args.experiment_name}")
-    print(f"Epochs: {train_config['training']['epochs']}")
-    print(f"Batch size (per GPU): {train_config['training']['batch_size']}")
     devices = train_config["training"].get("devices", 1)
-    if devices == -1:
-        print(f"Total Effective Batch size: Dynamic (all GPUs)")
-    else:
-        print(
-            f"Total Effective Batch size: {train_config['training']['batch_size'] * devices}"
-        )
-    print(f"Data dir: {paths_config['data']['output']['optimized_dir']}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"\n📊 Loss Weights (from utils/feature_config.py):")
-    print(f"  Performance: {perf_weights}")
-    print(f"  Microstructure: {micro_weights}")
-    print("=" * 80)
+    batch_size = train_config["training"]["batch_size"]
+    effective_batch = "Dynamic (all GPUs)" if devices == -1 else batch_size * devices
 
-
-@rank_zero_only
-def save_test_report(model, experiment_dir, logger):
-    """Save comprehensive test report to JSON"""
-    if not hasattr(model, "test_report"):
-        print("⚠️  No test report available")
-        return
-
-    # Add metadata
-    report = model.test_report.copy()
-    report["metadata"] = {
-        "experiment_name": experiment_dir.name,
-        "timestamp": datetime.now().isoformat(),
-        "tensorboard_log_dir": str(logger.log_dir),
-    }
-
-    # Save to experiment directory
-    report_dir = experiment_dir / "test_results"
-    report_dir.mkdir(exist_ok=True)
-
-    # Save with version number
-    version_num = logger.version
-    report_path = report_dir / f"test_report_version_{version_num}.json"
-
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2)
-
-    # Also save as latest
-    latest_path = report_dir / "test_report_latest.json"
-    with open(latest_path, "w") as f:
-        json.dump(report, f, indent=2)
-
-    print(f"\n💾 Test report saved:")
-    print(f"  ├─ {report_path}")
-    print(f"  └─ {latest_path}\n")
-
-
-@rank_zero_only
-def print_completion(checkpoint_path, log_dir, report_path):
     print("\n" + "=" * 80)
-    print("✅ Training Complete!")
+    print("🔋 BATTERY PREDICTION MODEL TRAINING")
     print("=" * 80)
-    print(f"Best checkpoint: {checkpoint_path}")
-    print(f"Logs: {log_dir}")
-    if report_path:
-        print(f"Test report: {report_path}")
+    print(f"Experiment:        {args.experiment_name}")
+    print(f"Epochs:            {train_config['training']['epochs']}")
+    print(f"Batch size:        {batch_size} per GPU")
+    print(f"Effective batch:   {effective_batch}")
+    print(f"Parameters:        {total_params:,}")
+    print(f"Data dir:          {paths_config['data']['output']['optimized_dir']}")
+    print(f"\n📊 Loss Weights:")
+    print(f"  Performance:     {perf_weights}")
+    print(f"  Microstructure:  {micro_weights}")
+    print("=" * 80 + "\n")
+
+
+@rank_zero_only
+def print_completion(checkpoint_path, log_dir):
+    """Print training completion summary"""
+    print("\n" + "=" * 80)
+    print("✅ TRAINING COMPLETE")
     print("=" * 80)
+    print(f"📁 Experiment dir:  {log_dir}")
+    print(f"🏆 Best checkpoint: {checkpoint_path}")
+    print(f"📊 TensorBoard:     tensorboard --logdir={log_dir}")
+    print("=" * 80 + "\n")
 
 
 def main(args):
-    # Seed
+    # Reproducibility
     pl.seed_everything(42, workers=True)
     torch.use_deterministic_algorithms(True, warn_only=True)
     torch.set_float32_matmul_precision("medium")
@@ -117,7 +70,7 @@ def main(args):
     with open("configs/train_config.yml", "r") as f:
         train_config = yaml.safe_load(f)
 
-    # Data
+    # Data module
     datamodule = BatteryDataModule(
         data_dir=paths_config["data"]["output"]["optimized_dir"],
         batch_size=train_config["training"]["batch_size"],
@@ -126,36 +79,39 @@ def main(args):
 
     # Model
     model = BatteryLightningModel(train_config)
-
-    # Count params
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print_config(args, train_config, paths_config, total_params)
 
-    # Setup experiment directory
-    experiment_dir = Path("experiments") / args.experiment_name
+    # Print info
+    print_training_info(args, train_config, paths_config, total_params)
 
-    # Callbacks
+    # Logger - creates experiments/{experiment_name}/version_X/
+    logger = TensorBoardLogger(
+        save_dir="experiments",
+        name=args.experiment_name,
+        default_hp_metric=False,
+    )
+
+    # Checkpoint callback - saves to version_X/checkpoints/
     checkpoint_callback = ModelCheckpoint(
-        dirpath=experiment_dir / "checkpoints",
+        dirpath=Path(logger.log_dir) / "checkpoints",
         filename="epoch{epoch:02d}-val_loss{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
         save_top_k=3,
-        save_last=train_config["training"]["checkpoint"].get("save_last", True),
+        save_last=True,
+        verbose=False,
     )
 
+    # Early stopping
     early_stopping = EarlyStopping(
         monitor="val_loss",
         patience=train_config["training"]["early_stopping"]["patience"],
         mode="min",
         verbose=True,
-        check_on_train_epoch_end=False,
     )
 
+    # Learning rate monitor
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
-
-    # Logger
-    logger = TensorBoardLogger(save_dir="experiments", name=args.experiment_name)
 
     # Trainer
     trainer = pl.Trainer(
@@ -170,34 +126,29 @@ def main(args):
         deterministic="warn",
         log_every_n_steps=10,
         num_sanity_val_steps=0,
-        check_val_every_n_epoch=1,
-        val_check_interval=1.0,
     )
 
     # Train
     trainer.fit(model, datamodule)
 
-    # Test with best model
+    # Test with best checkpoint
     print("\n" + "=" * 80)
-    print("🧪 Running comprehensive testing on best model...")
-    print("=" * 80)
+    print("🧪 TESTING BEST MODEL")
+    print("=" * 80 + "\n")
 
     trainer.test(model, datamodule, ckpt_path="best")
 
-    # Save test report
-    save_test_report(model, experiment_dir, logger)
-
     # Print completion
-    report_path = (
-        experiment_dir / "test_results" / f"test_report_version_{logger.version}.json"
-    )
-    print_completion(checkpoint_callback.best_model_path, logger.log_dir, report_path)
+    print_completion(checkpoint_callback.best_model_path, logger.log_dir)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Train battery prediction model")
     parser.add_argument(
-        "--experiment_name", type=str, default="baseline", help="Experiment name"
+        "--experiment_name",
+        type=str,
+        default="baseline",
+        help="Experiment name (creates experiments/{name}/version_X/)",
     )
     args = parser.parse_args()
     main(args)
