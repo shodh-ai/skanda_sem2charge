@@ -10,16 +10,10 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities import rank_zero_only
-import warnings
 
 from src.battery_datamodule import BatteryDataModule
 from src.lightning_model import BatteryLightningModel
 from src.utils import get_loss_weight_lists
-
-
-# Suppress warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="pytorch_lightning")
-torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 
 @rank_zero_only
@@ -38,6 +32,7 @@ def print_training_info(args, train_config, paths_config, total_params):
     print(f"Batch size:        {batch_size} per GPU")
     print(f"Effective batch:   {effective_batch}")
     print(f"Parameters:        {total_params:,}")
+    print(f"Model size:        {total_params * 4 / 1024 / 1024:.2f} MB (fp32)")
     print(f"Data dir:          {paths_config['data']['output']['optimized_dir']}")
     print(f"\n📊 Loss Weights:")
     print(f"  Performance:     {perf_weights}")
@@ -107,7 +102,6 @@ def main(args):
         monitor="val_loss",
         patience=train_config["training"]["early_stopping"]["patience"],
         mode="min",
-        verbose=True,
     )
 
     # Learning rate monitor
@@ -121,11 +115,10 @@ def main(args):
         precision=train_config["training"]["precision"],
         gradient_clip_val=train_config["training"]["gradient_clip_val"],
         strategy="ddp" if train_config["training"]["devices"] != 1 else "auto",
-        callbacks=[checkpoint_callback, early_stopping, lr_monitor],
+        callbacks=[checkpoint_callback, lr_monitor],
         logger=logger,
         deterministic="warn",
         log_every_n_steps=10,
-        num_sanity_val_steps=0,
     )
 
     # Train

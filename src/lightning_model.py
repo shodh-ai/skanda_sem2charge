@@ -24,15 +24,6 @@ from .utils import (
 
 
 class BatteryLightningModel(pl.LightningModule):
-    """
-    Lightning wrapper for battery prediction with comprehensive per-feature metrics.
-
-    Features:
-    - Separate R² tracking for each output feature
-    - Weighted multi-task loss
-    - Detailed logging and reporting
-    - Support for feature-specific analysis
-    """
 
     def __init__(self, config: Dict):
         super().__init__()
@@ -100,6 +91,7 @@ class BatteryLightningModel(pl.LightningModule):
         pred_perf = pred["performance"]
         target_micro = batch["microstructure_outputs"]
         target_perf = batch["performance_outputs"]
+        batch_size = pred_micro.shape[0]
 
         # Compute losses
         losses = self.compute_weighted_loss(
@@ -117,6 +109,7 @@ class BatteryLightningModel(pl.LightningModule):
             on_step=True,
             on_epoch=True,
             sync_dist=True,
+            batch_size=batch_size,
         )
         self.log(
             "train_micro_loss",
@@ -125,6 +118,7 @@ class BatteryLightningModel(pl.LightningModule):
             on_step=True,
             on_epoch=True,
             sync_dist=True,
+            batch_size=batch_size,
         )
         self.log(
             "train_perf_loss",
@@ -133,6 +127,7 @@ class BatteryLightningModel(pl.LightningModule):
             on_step=True,
             on_epoch=True,
             sync_dist=True,
+            batch_size=batch_size,
         )
 
         return total_loss
@@ -149,34 +144,16 @@ class BatteryLightningModel(pl.LightningModule):
         losses = self.compute_weighted_loss(
             pred_micro, target_micro, pred_perf, target_perf
         )
-        total_loss = losses["total_loss"]
+        loss = losses["total_loss"]
         micro_loss = losses["micro_loss"]
         perf_loss = losses["perf_loss"]
 
         # Logging in validation step
-        self.log(
-            "val_loss",
-            total_loss,
-            prog_bar=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "val_micro_loss",
-            micro_loss,
-            prog_bar=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        self.log(
-            "val_perf_loss",
-            perf_loss,
-            prog_bar=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val_micro_loss", micro_loss, sync_dist=True)
+        self.log("val_perf_loss", perf_loss, sync_dist=True)
 
-        return total_loss
+        return loss
 
     def test_step(self, batch, batch_idx):
         """Test step - accumulate predictions and targets"""
@@ -185,6 +162,7 @@ class BatteryLightningModel(pl.LightningModule):
         pred_perf = pred["performance"]
         target_micro = batch["microstructure_outputs"]
         target_perf = batch["performance_outputs"]
+        batch_size = pred_micro.shape[0]
 
         # Compute losses
         losses = self.compute_weighted_loss(
@@ -201,11 +179,55 @@ class BatteryLightningModel(pl.LightningModule):
         self.test_target_perf.append(target_perf.detach().cpu())
 
         # Log only losses to tensorboard
-        self.log("test_loss", total_loss, sync_dist=True)
-        self.log("test_micro_loss", micro_loss, sync_dist=True)
-        self.log("test_perf_loss", perf_loss, sync_dist=True)
+        self.log(
+            "test_loss",
+            total_loss,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "test_micro_loss",
+            micro_loss,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "test_perf_loss",
+            perf_loss,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
 
         return total_loss
+
+    def configure_optimizers(self):
+        """Configure optimizer and learning rate scheduler"""
+        opt_cfg = self.config["optimizer"]
+
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=opt_cfg["lr"],
+            weight_decay=opt_cfg["weight_decay"],
+            betas=opt_cfg.get("betas", (0.9, 0.999)),
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=self.config["scheduler"]["factor"],
+            patience=self.config["scheduler"]["patience"],
+            min_lr=self.config["scheduler"]["min_lr"],
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def on_test_epoch_end(self):
         """Compute comprehensive metrics from stored predictions"""
@@ -302,43 +324,18 @@ class BatteryLightningModel(pl.LightningModule):
         # Save predictions and targets
         self._save_predictions(pred_micro, pred_perf, target_micro, target_perf, report)
 
-    def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler"""
-        opt_cfg = self.config["optimizer"]
-
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg["weight_decay"],
-            betas=opt_cfg.get("betas", (0.9, 0.999)),
-        )
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=self.config["scheduler"]["factor"],
-            patience=self.config["scheduler"]["patience"],
-            min_lr=self.config["scheduler"]["min_lr"],
-            verbose=True,
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
     def _save_predictions(
         self, pred_micro, pred_perf, target_micro, target_perf, report
     ):
         """Save predictions, targets, and report to experiment directory"""
         # Save to logger's directory (experiments/{name}/version_X/test_results/)
-        save_dir = Path(self.logger.log_dir) / "test_results"
+        if self.trainer.log_dir:
+            save_dir = Path(self.trainer.log_dir) / "test_results"
+        else:
+            save_dir = Path("test_results")
+
         save_dir.mkdir(exist_ok=True, parents=True)
+        print(f"\n💾 Saving test results to: {save_dir}")
 
         # Save arrays
         np.save(save_dir / "predictions_microstructure.npy", pred_micro.numpy())
