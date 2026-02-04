@@ -115,7 +115,7 @@ def main(args):
         precision=train_config["training"]["precision"],
         gradient_clip_val=train_config["training"]["gradient_clip_val"],
         strategy="ddp" if train_config["training"]["devices"] != 1 else "auto",
-        callbacks=[checkpoint_callback, lr_monitor],
+        callbacks=[checkpoint_callback, lr_monitor, early_stopping],
         logger=logger,
         deterministic="warn",
         log_every_n_steps=10,

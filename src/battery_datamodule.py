@@ -1,6 +1,5 @@
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader
 from litdata import StreamingDataset
 from litdata import StreamingDataLoader
 from pathlib import Path
@@ -117,29 +116,25 @@ class BatteryDataModule(pl.LightningDataModule):
         print(f"📊 Test samples:  {len(self.test_dataset):,}")
 
     def train_dataloader(self):
-        return DataLoader(
+        return StreamingDataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             collate_fn=collate_fn,
             pin_memory=self.pin_memory,
-            persistent_workers=True if self.num_workers > 0 else False,
-            drop_last=True,
         )
 
     def val_dataloader(self):
-        return DataLoader(
+        return StreamingDataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             collate_fn=collate_fn,
             pin_memory=self.pin_memory,
-            persistent_workers=False,
-            drop_last=False,
         )
 
     def test_dataloader(self):
-        return DataLoader(
+        return StreamingDataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
