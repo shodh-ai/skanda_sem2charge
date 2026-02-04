@@ -119,6 +119,8 @@ def main(args):
         logger=logger,
         deterministic="warn",
         log_every_n_steps=10,
+        num_sanity_val_steps=2,
+        check_val_every_n_epoch=1,
     )
 
     # Train

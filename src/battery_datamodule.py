@@ -2,6 +2,7 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 from litdata import StreamingDataset
+from litdata import StreamingDataLoader
 from pathlib import Path
 import numpy as np
 import json
@@ -133,7 +134,8 @@ class BatteryDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=collate_fn,
             pin_memory=self.pin_memory,
-            persistent_workers=True if self.num_workers > 0 else False,
+            persistent_workers=False,
+            drop_last=False,
         )
 
     def test_dataloader(self):
