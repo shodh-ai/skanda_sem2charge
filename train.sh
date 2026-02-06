@@ -2,7 +2,7 @@
 #SBATCH --job-name=battery_train
 #SBATCH --partition=h100
 #SBATCH --nodes=2
-#SBATCH --gres=gpu:H100:8
+#SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=96
 #SBATCH --mem=0
 #SBATCH --time=24:00:00
