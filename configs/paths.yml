@@ -4,12 +4,12 @@ data:
 
   # Input data
   input:
-    images_dir: "output_parameter_sweep"
-    image_pattern: "sample_{:04d}.tif"
-    final_results_csv: "output_parameter_sweep/final_results.csv"
-    tau_results_csv: "output_parameter_sweep/taufactor_results.csv"
+    images_dir: "final_output"
+    image_pattern: "sample_{:05d}.tif"
+    final_results_csv: "final_output/final_results.csv"
+    tau_results_csv: "final_output/taufactor_results.csv"
     parquet_dir: "final_pybamm_output"
-    parquet_pattern: "sample_{:04d}.parquet"
+    parquet_pattern: "sample_{:05d}.parquet"
 
   # Output data
   output:

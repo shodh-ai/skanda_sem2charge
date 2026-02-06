@@ -1,6 +1,6 @@
 # Dataset split configuration
 data:
-  total_samples: 100
+  total_samples: 15000
   params_per_sample: 100
 
   # Split ratios
@@ -16,8 +16,8 @@ data:
   normalization_method: "zscore"
 
   # Optimization settings
-  chunk_size: 64
-  num_workers: 4
+  chunk_size: 128
+  num_workers: 16
 
   # Image preprocessing
   image:

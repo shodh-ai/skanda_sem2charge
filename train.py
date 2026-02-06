@@ -1,3 +1,4 @@
+import os
 import torch
 import yaml
 import argparse
@@ -37,6 +38,12 @@ def print_training_info(args, train_config, paths_config, total_params):
     print(f"\n📊 Loss Weights:")
     print(f"  Performance:     {perf_weights}")
     print(f"  Microstructure:  {micro_weights}")
+    if "SLURM_JOB_ID" in os.environ:
+        print(f"\n🖥️  SLURM Info:")
+        print(f"  Job ID:          {os.environ.get('SLURM_JOB_ID')}")
+        print(f"  Nodelist:        {os.environ.get('SLURM_NODELIST')}")
+        print(f"  Local Rank:      {os.environ.get('SLURM_LOCALID', 'N/A')}")
+        print(f"  Global Rank:     {os.environ.get('SLURM_PROCID', 'N/A')}")
     print("=" * 80 + "\n")
 
 
@@ -64,6 +71,15 @@ def main(args):
 
     with open("configs/train_config.yml", "r") as f:
         train_config = yaml.safe_load(f)
+
+    num_nodes = int(
+        os.environ.get("SLURM_NNODES", train_config["training"].get("num_nodes", 1))
+    )
+    gpus_per_node = train_config["training"].get("devices", -1)
+
+    # If devices is -1, auto-detect GPUs
+    if gpus_per_node == -1:
+        gpus_per_node = torch.cuda.device_count()
 
     # Data module
     datamodule = BatteryDataModule(
@@ -111,7 +127,8 @@ def main(args):
     trainer = pl.Trainer(
         max_epochs=train_config["training"]["epochs"],
         accelerator=train_config["training"]["accelerator"],
-        devices=train_config["training"]["devices"],
+        devices=gpus_per_node,
+        num_nodes=num_nodes,
         precision=train_config["training"]["precision"],
         gradient_clip_val=train_config["training"]["gradient_clip_val"],
         strategy="ddp" if train_config["training"]["devices"] != 1 else "auto",
@@ -121,15 +138,17 @@ def main(args):
         log_every_n_steps=10,
         num_sanity_val_steps=2,
         check_val_every_n_epoch=1,
+        sync_batchnorm=True,
     )
 
     # Train
     trainer.fit(model, datamodule)
 
     # Test with best checkpoint
-    print("\n" + "=" * 80)
-    print("🧪 TESTING BEST MODEL")
-    print("=" * 80 + "\n")
+    if trainer.global_rank == 0:
+        print("\n" + "=" * 80)
+        print("🧪 TESTING BEST MODEL")
+        print("=" * 80 + "\n")
 
     trainer.test(model, datamodule, ckpt_path="best")
 

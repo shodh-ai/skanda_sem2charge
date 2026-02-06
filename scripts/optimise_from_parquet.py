@@ -402,13 +402,22 @@ def main():
     )
 
     # Load pruned data
-    pruned_file = Path("data") / "intermediate_pruned.parquet"
-    print(f"\n📂 Loading pruned data from: {pruned_file}")
+    pruned_folder = Path("data") / "intermediate_pruned"
 
-    if not pruned_file.exists():
-        raise FileNotFoundError(f"Pruned data not found: {pruned_file}")
+    # Fallback: Check if the folder has the .parquet extension (from previous runs)
+    if (
+        not pruned_folder.exists()
+        and (Path("data") / "intermediate_pruned.parquet").exists()
+    ):
+        pruned_folder = Path("data") / "intermediate_pruned.parquet"
 
-    df_full = pd.read_parquet(pruned_file)
+    print(f"\n📂 Loading pruned data from: {pruned_folder}")
+
+    if not pruned_folder.exists():
+        raise FileNotFoundError(f"Pruned data directory not found: {pruned_folder}")
+
+    # Pandas automatically detects it is a directory and reads all part_*.parquet files
+    df_full = pd.read_parquet(pruned_folder)
     print(f"✓ Loaded {len(df_full):,} samples")
 
     # Validate data structure

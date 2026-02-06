@@ -545,46 +545,53 @@ def gather_and_save_pruned_data(
     comm,
     rank: int,
 ):
-    """Gather pruned data and save to single file"""
+    """
+    Save pruned data as a partitioned Parquet dataset.
+    Avoids MPI gather crashes by letting every rank write its own file.
+    """
 
-    # Get original rows that match pruned indices
+    # 1. Filter local data to match pruned indices
     df_export_local = df_original_local[
         df_original_local.index.isin(df_pruned_local.index)
     ].copy()
 
-    if comm is not None:
-        all_dfs = comm.gather(df_export_local, root=0)
-
-        if rank == 0:
-            all_dfs_filtered = [df for df in all_dfs if len(df) > 0]
-
-            if len(all_dfs_filtered) > 0:
-                df_pruned_full = pd.concat(all_dfs_filtered, ignore_index=True)
-            else:
-                df_pruned_full = pd.DataFrame()
-        else:
-            df_pruned_full = None
-    else:
-        df_pruned_full = df_export_local
-
-    # Save (only rank 0)
+    # 2. Prepare Output Directory
+    # We treat 'intermediate_pruned.parquet' as a FOLDER, not a file.
     if rank == 0:
-        if df_pruned_full is None or len(df_pruned_full) == 0:
-            print(f"\n❌ WARNING: No data to save! All rows were filtered out.")
-            return
+        # If a single file exists with this name, delete it to create a folder
+        if output_file.exists() and output_file.is_file():
+            try:
+                output_file.unlink()
+                print(f"   Removed existing single file to create dataset directory.")
+            except OSError:
+                pass
 
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        df_pruned_full = df_pruned_full.reset_index(drop=True)
-        df_pruned_full.to_parquet(output_file, compression="snappy", index=False)
+        output_file.mkdir(parents=True, exist_ok=True)
 
-        file_size_mb = output_file.stat().st_size / (1024 * 1024)
+    # Wait for Rank 0 to create the directory
+    if comm is not None:
+        comm.Barrier()
 
-        print(f"\n✅ PRUNED DATA SAVED SUCCESSFULLY!")
+    # 3. Write Local Partition
+    if len(df_export_local) > 0:
+        # Create a unique filename for this rank: part_00001.parquet
+        part_path = output_file / f"part_{rank:05d}.parquet"
+        df_export_local.reset_index(drop=True).to_parquet(
+            part_path, compression="snappy", index=False
+        )
+
+    # 4. Final Sync
+    if comm is not None:
+        comm.Barrier()
+
+    if rank == 0:
+        # Count files to ensure success
+        num_files = len(list(output_file.glob("part_*.parquet")))
+        print(f"\n✅ PRUNED DATA SAVED SUCCESSFULLY (Partitioned)!")
         print(f"{'─'*80}")
-        print(f"   File: {output_file}")
-        print(f"   Rows: {len(df_pruned_full):,}")
-        print(f"   Columns: {len(df_pruned_full.columns)}")
-        print(f"   Size: {file_size_mb:.2f} MB")
+        print(f"   Location: {output_file}")
+        print(f"   Partitions created: {num_files}")
+        print(f"   (Pandas will read this folder automatically as a single dataset)")
         print(f"{'─'*80}")
 
 
@@ -606,7 +613,7 @@ def main():
     config, paths = load_config()
 
     intermediate_dir = Path(paths["data"]["output"]["intermediate_dir"])
-    output_file = Path("data") / "intermediate_pruned.parquet"
+    output_file = Path("data") / "intermediate_pruned"
 
     if rank == 0:
         print(f"\n   Input: {intermediate_dir}")

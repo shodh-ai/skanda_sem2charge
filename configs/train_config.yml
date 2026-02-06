@@ -1,36 +1,38 @@
 # Training hyperparameters
 training:
   epochs: 100
-  batch_size: 32
-  num_workers: 24
+  batch_size: 8
+  num_workers: 12
+  num_nodes: 2
   accelerator: "gpu"
-  devices: -1
+  devices: 8
   precision: "16-mixed"
   gradient_clip_val: 1.0
 
   # Early stopping
   early_stopping:
     monitor: "val_loss"
-    patience: 20
+    patience: 15
     mode: "min"
     save_last: true
 
   # Model checkpointing
   checkpoint:
     monitor: "val_loss"
-    save_top_k: 3
+    save_top_k: 5
     mode: "min"
 
 # Optimizer
 optimizer:
   name: "adamw"
-  lr: 0.0003
+  lr: 0.001
   weight_decay: 0.01
   betas: [0.9, 0.999]
+  eps: 1.0e-8
 
 # Scheduler
 scheduler:
-  name: "reduce_on_plateau"
-  patience: 15
-  factor: 0.5
-  min_lr: 1.0e-7
+  name: "cosine_with_warmup"
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  T_max: 100

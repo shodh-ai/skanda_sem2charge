@@ -201,33 +201,80 @@ class BatteryLightningModel(pl.LightningModule):
         return total_loss
 
     def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler"""
+        """Configure optimizer with cosine annealing + warmup for large dataset"""
         opt_cfg = self.config["optimizer"]
+        sched_cfg = self.config["scheduler"]
 
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=opt_cfg["lr"],
             weight_decay=opt_cfg["weight_decay"],
             betas=opt_cfg.get("betas", (0.9, 0.999)),
+            eps=opt_cfg.get("eps", 1e-8),
         )
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=self.config["scheduler"]["factor"],
-            patience=self.config["scheduler"]["patience"],
-            min_lr=self.config["scheduler"]["min_lr"],
-        )
+        # Use cosine annealing with warmup for large datasets
+        if sched_cfg["name"] == "cosine_with_warmup":
+            from torch.optim.lr_scheduler import (
+                CosineAnnealingLR,
+                LinearLR,
+                SequentialLR,
+            )
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
+            warmup_epochs = sched_cfg.get("warmup_epochs", 5)
+            total_epochs = self.config["training"]["epochs"]
+
+            # Warmup scheduler
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.01,  # Start from 1% of base LR
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+
+            # Cosine annealing scheduler
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=total_epochs - warmup_epochs,
+                eta_min=sched_cfg.get("min_lr", 1e-6),
+            )
+
+            # Combine schedulers
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs],
+            )
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
+
+        else:
+            # Fallback to ReduceLROnPlateau
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=sched_cfg.get("factor", 0.5),
+                patience=sched_cfg.get("patience", 10),
+                min_lr=sched_cfg.get("min_lr", 1e-6),
+                verbose=True,
+            )
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val_loss",
+                    "interval": "epoch",
+                    "frequency": 1,
+                },
+            }
 
     def on_test_epoch_end(self):
         """Compute comprehensive metrics from stored predictions"""
